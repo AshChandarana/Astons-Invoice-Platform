@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Local SQLite database (never commit)
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+.streamlit/secrets.toml
+.env
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor junk
+.vscode/
+.idea/

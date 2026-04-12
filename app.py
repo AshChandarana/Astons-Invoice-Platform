@@ -167,6 +167,9 @@ def team_new_submission(user):
         tuple((f.name, f.size) for f in uploaded) if uploaded else (),
     )
     if st.session_state.get("last_gen_key") != current_key:
+        # Clear old submitted flags from previous batch
+        for old_key in [k for k in st.session_state if k.startswith("submitted_")]:
+            del st.session_state[old_key]
         st.session_state["generated"] = []
         st.session_state["gen_errors"] = []
         st.session_state["last_gen_key"] = current_key

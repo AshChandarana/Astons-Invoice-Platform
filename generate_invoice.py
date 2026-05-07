@@ -346,33 +346,23 @@ def generate_branded_invoice(data, output_path):
         textColor=ASTONS_TEXT,
     )
     
-    # Service lines with amounts
-    has_multiple_items = len(data.get('line_items', [])) > 1
-    
+    # Service lines with amounts. Per-line amount is always shown,
+    # so single-item invoices read the same as multi-item ones.
     for i, item in enumerate(data.get('line_items', [])):
         c.setFont("Helvetica", 9)
         c.setFillColor(ASTONS_GREY)
         c.drawString(left_margin + 5*mm, y, f"{i+1}.")
-        
-        text_width = content_width - 45*mm if has_multiple_items else content_width - 15*mm
+
+        text_width = content_width - 45*mm
         p = Paragraph(item['description'], desc_style)
         pw, ph = p.wrap(text_width, 200)
         p.drawOn(c, left_margin + 15*mm, y - ph + 9)
-        
-        if has_multiple_items:
-            c.setFont("Helvetica", 9)
-            c.setFillColor(ASTONS_TEXT)
-            c.drawRightString(right_margin, y, item['amount'])
-        
+
+        c.setFont("Helvetica", 9)
+        c.setFillColor(ASTONS_TEXT)
+        c.drawRightString(right_margin, y, item['amount'])
+
         y -= max(ph + 3*mm, 7*mm)
-    
-    # Closing narrative
-    y -= 2*mm
-    c.setFont("Helvetica", 9)
-    c.setFillColor(ASTONS_GREY)
-    c.drawString(left_margin + 15*mm, y, "all including —")
-    y -= 5.5*mm
-    c.drawString(left_margin + 15*mm, y, "Correspondence and advice, generally, to date.")
     
     # === TOTALS SECTION ===
     y -= 18*mm
@@ -454,17 +444,31 @@ def generate_branded_invoice(data, output_path):
         c.drawString(left_margin + 35*mm, y, value)
         y -= 5*mm
     
-    # Stripe payment link - same spacing as bank detail lines
+    # Stripe payment link - underlined for clarity, with a generous
+    # click region so different PDF readers (Acrobat, Preview, browser
+    # built-ins) all reliably register the click.
     c.setFont("Helvetica", 8)
     c.setFillColor(ASTONS_SUBTLE)
     c.drawString(left_margin, y, "Pay online:")
+
+    link_text = "Click here to pay by card"
+    link_x = left_margin + 35*mm
     c.setFont("Helvetica-Bold", 8)
     c.setFillColor(ASTONS_MID_GREEN)
-    c.drawString(left_margin + 35*mm, y, "Click here to pay by card")
-    link_width = c.stringWidth("Click here to pay by card", "Helvetica-Bold", 8)
-    c.linkURL("https://buy.stripe.com/28EfZi01TgGg6fh26H8Zq04",
-              (left_margin + 35*mm, y - 2, left_margin + 35*mm + link_width, y + 8),
-              relative=0)
+    c.drawString(link_x, y, link_text)
+    link_text_width = c.stringWidth(link_text, "Helvetica-Bold", 8)
+
+    # Underline so users can see it's a link
+    c.setStrokeColor(ASTONS_MID_GREEN)
+    c.setLineWidth(0.5)
+    c.line(link_x, y - 1.2, link_x + link_text_width, y - 1.2)
+
+    # Generous click rectangle: 2pt padding all round, taller than text
+    c.linkURL(
+        "https://buy.stripe.com/28EfZi01TgGg6fh26H8Zq04",
+        (link_x - 2, y - 4, link_x + link_text_width + 2, y + 10),
+        relative=0,
+    )
     
     # === FOOTER (anchored to bottom) ===
     footer_y = 18*mm

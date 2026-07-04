@@ -321,6 +321,30 @@ def mark_invoice_sent(invoice_id: int, user_id: int) -> None:
         _write_audit(conn, user_id, invoice_id, "mark_sent")
 
 
+def find_active_by_invoice_no(invoice_no: str):
+    """Return non-rejected invoices with this invoice number.
+
+    Used as the duplicate-submission check. Rejected invoices are
+    excluded so a team member can legitimately resubmit after a
+    rejection.
+    """
+    if not invoice_no:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT i.id, i.created_at, i.status, i.invoice_no, i.client_name,
+                   u.full_name AS created_by_name
+            FROM invoices i
+            JOIN users u ON i.created_by_user_id = u.id
+            WHERE i.invoice_no = ? AND i.status != 'rejected'
+            ORDER BY i.created_at DESC
+            """,
+            (invoice_no,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def count_by_status() -> dict:
     with get_conn() as conn:
         rows = conn.execute(

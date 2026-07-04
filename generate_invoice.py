@@ -72,8 +72,9 @@ def parse_brightmanager_pdf(pdf_path):
     data = {}
     
     with pdfplumber.open(pdf_path) as pdf:
+        data['page_count'] = len(pdf.pages)
         text = pdf.pages[0].extract_text()
-        
+
         # Extract page 2 for VAT number
         if len(pdf.pages) > 1:
             text2 = pdf.pages[1].extract_text() or ""
@@ -212,6 +213,58 @@ def parse_brightmanager_pdf(pdf_path):
         data['vat_reg_formatted'] = f"GB {data['vat_reg']}"
     
     return data
+
+
+def validate_invoice_data(data):
+    """Check that everything needed for a correct invoice was parsed.
+
+    Returns a list of human-readable problems. Empty list means the
+    invoice is safe to generate and submit. This is the guardrail that
+    stops a fee note with overflowing content (page 2 spill) from
+    silently producing an invoice with missing figures or address.
+    """
+    problems = []
+
+    if not data.get('invoice_no'):
+        problems.append("Invoice number could not be read from the PDF.")
+    if not data.get('date'):
+        problems.append("Invoice date could not be read from the PDF.")
+    if not data.get('client_name'):
+        problems.append("Client name could not be read from the PDF.")
+    if not data.get('client_address'):
+        problems.append("Client address could not be read from the PDF.")
+    if not data.get('line_items'):
+        problems.append("No line items could be read from the PDF.")
+    if not data.get('subtotal'):
+        problems.append("Net fee (subtotal) could not be read from the PDF.")
+    if not data.get('vat'):
+        problems.append("VAT amount could not be read from the PDF.")
+    if not data.get('total'):
+        problems.append("Gross total could not be read from the PDF.")
+
+    # Arithmetic sanity check: net + VAT must equal the total
+    try:
+        sub = float(data['subtotal'].replace(',', ''))
+        vat = float(data['vat'].replace(',', ''))
+        tot = float(data['total'].replace(',', ''))
+        if abs((sub + vat) - tot) > 0.011:
+            problems.append(
+                f"Figures don't add up: net £{data['subtotal']} + VAT £{data['vat']} "
+                f"does not equal total £{data['total']}."
+            )
+    except (ValueError, AttributeError):
+        pass  # missing figures are already reported above
+
+    # If anything failed AND the fee note has spilled past one page,
+    # the overflow is almost certainly the cause — say so plainly.
+    if problems and data.get('page_count', 1) > 1:
+        problems.append(
+            f"This fee note runs to {data['page_count']} pages, so content has "
+            "probably overflowed page 1. Shorten the descriptions or reduce the "
+            "number of line items in BrightManager, re-export the PDF and try again."
+        )
+
+    return problems
 
 
 def draw_logo_placeholder(c, x, y, width, height):

@@ -29,7 +29,16 @@ from generate_invoice import (
     parse_brightmanager_pdf,
     generate_branded_invoice,
     apply_portfolio,
+    validate_invoice_data,
 )
+
+
+STATUS_LABELS = {
+    "pending_approval": "pending approval",
+    "approved": "approved",
+    "rejected": "rejected",
+    "sent": "sent",
+}
 
 
 # === PAGE CONFIG ===
@@ -180,6 +189,7 @@ def team_new_submission(user):
         if st.button("Generate branded previews", type="primary"):
             generated = []
             errors = []
+            batch_invoice_nos = {}  # invoice_no -> source filename, for same-batch duplicates
             progress = st.progress(0, text="Starting...")
 
             with tempfile.TemporaryDirectory() as tmp:
@@ -196,6 +206,25 @@ def team_new_submission(user):
 
                         data = parse_brightmanager_pdf(in_path)
                         apply_portfolio(data, portfolio_key)
+
+                        # Guardrail: refuse to generate an invoice with
+                        # missing or inconsistent data instead of producing
+                        # a bad PDF that has to be caught at approval.
+                        problems = validate_invoice_data(data)
+                        if problems:
+                            errors.append({
+                                "source": up.name,
+                                "error": "Couldn't read this fee note correctly — not generated.",
+                                "trace": "\n".join(f"• {p}" for p in problems),
+                            })
+                            continue
+
+                        # Duplicate checks: against the database, and
+                        # against other files in this same upload.
+                        existing = db.find_active_by_invoice_no(data["invoice_no"])
+                        duplicate = existing[0] if existing else None
+                        dup_in_batch = batch_invoice_nos.get(data["invoice_no"])
+                        batch_invoice_nos.setdefault(data["invoice_no"], up.name)
 
                         clean = re.sub(r"[^\w\s-]", "", data["client_name"]).strip().replace(" ", "_")
                         out_filename = f"Astons_Invoice_{data['invoice_no']}_{clean}.pdf"
@@ -214,6 +243,8 @@ def team_new_submission(user):
                             "invoice_no": data["invoice_no"],
                             "total": data.get("total", ""),
                             "portfolio": portfolio_key,
+                            "duplicate": duplicate,
+                            "dup_in_batch": dup_in_batch,
                         })
                     except Exception as exc:
                         errors.append({
@@ -259,7 +290,9 @@ def team_new_submission(user):
                     )
                 with cols[3]:
                     submit_key = f"submit_{idx}"
-                    if st.session_state.get(f"submitted_{idx}"):
+                    if item.get("duplicate") or item.get("dup_in_batch"):
+                        st.error("Duplicate — blocked")
+                    elif st.session_state.get(f"submitted_{idx}"):
                         st.success("Submitted")
                     else:
                         if st.button(
@@ -268,24 +301,50 @@ def team_new_submission(user):
                             type="primary",
                             use_container_width=True,
                         ):
-                            db.create_invoice(
-                                created_by_user_id=user["id"],
-                                portfolio=item["portfolio"],
-                                client_name=item["client_name"],
-                                invoice_no=item["invoice_no"],
-                                total=item["total"],
-                                source_pdf=item["source_bytes"],
-                                source_pdf_filename=item["source_name"],
-                                branded_pdf=item["branded_bytes"],
-                                branded_pdf_filename=item["branded_name"],
-                            )
-                            st.session_state[f"submitted_{idx}"] = True
-                            st.rerun()
+                            # Re-check just before writing, in case a
+                            # colleague submitted the same invoice since
+                            # the previews were generated.
+                            if db.find_active_by_invoice_no(item["invoice_no"]):
+                                st.error(
+                                    f"Invoice {item['invoice_no']} has just been "
+                                    "submitted by someone else — not submitted again."
+                                )
+                            else:
+                                db.create_invoice(
+                                    created_by_user_id=user["id"],
+                                    portfolio=item["portfolio"],
+                                    client_name=item["client_name"],
+                                    invoice_no=item["invoice_no"],
+                                    total=item["total"],
+                                    source_pdf=item["source_bytes"],
+                                    source_pdf_filename=item["source_name"],
+                                    branded_pdf=item["branded_bytes"],
+                                    branded_pdf_filename=item["branded_name"],
+                                )
+                                st.session_state[f"submitted_{idx}"] = True
+                                st.rerun()
 
-        # Submit-all convenience
+                if item.get("duplicate"):
+                    d = item["duplicate"]
+                    st.warning(
+                        f"Invoice {item['invoice_no']} was already submitted by "
+                        f"**{d['created_by_name']}** on {format_timestamp(d['created_at'])} "
+                        f"(status: {STATUS_LABELS.get(d['status'], d['status'])}). "
+                        "If this is genuinely a new invoice, check the invoice number "
+                        "in BrightManager."
+                    )
+                elif item.get("dup_in_batch"):
+                    st.warning(
+                        f"Invoice {item['invoice_no']} appears twice in this upload "
+                        f"(also in **{item['dup_in_batch']}**) — only one copy can be submitted."
+                    )
+
+        # Submit-all convenience (duplicates are excluded)
         unsubmitted_indices = [
             i for i in range(len(generated))
             if not st.session_state.get(f"submitted_{i}")
+            and not generated[i].get("duplicate")
+            and not generated[i].get("dup_in_batch")
         ]
         if len(unsubmitted_indices) > 1:
             if st.button(
@@ -295,6 +354,8 @@ def team_new_submission(user):
             ):
                 for i in unsubmitted_indices:
                     item = generated[i]
+                    if db.find_active_by_invoice_no(item["invoice_no"]):
+                        continue  # became a duplicate since previews were generated
                     db.create_invoice(
                         created_by_user_id=user["id"],
                         portfolio=item["portfolio"],

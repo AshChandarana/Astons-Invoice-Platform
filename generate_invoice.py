@@ -89,9 +89,14 @@ def parse_brightmanager_pdf(pdf_path):
     m = re.search(r'Date\s+(\d{1,2}\s+\w+\s+\d{4})', text)
     data['date'] = m.group(1) if m else ''
     
-    # Due date
+    # Due date. BUSINESS RULE: Astons terms are always "Upon presentation"
+    # (printed on every branded invoice), so the due date must equal the
+    # invoice date. BrightManager's "Due By" field defaults to ~7 days out,
+    # which contradicts the printed terms — so it is ignored here.
     m = re.search(r'Due By\s+(\d{1,2}\s+\w+\s+\d{4})', text)
     data['due_date'] = m.group(1) if m else ''
+    if data['date']:
+        data['due_date'] = data['date']
     
     # Client name and address - use word positions for reliable two-column separation
     with pdfplumber.open(pdf_path) as pdf2:
@@ -255,14 +260,24 @@ def validate_invoice_data(data):
     except (ValueError, AttributeError):
         pass  # missing figures are already reported above
 
-    # If anything failed AND the fee note has spilled past one page,
-    # the overflow is almost certainly the cause — say so plainly.
-    if problems and data.get('page_count', 1) > 1:
-        problems.append(
-            f"This fee note runs to {data['page_count']} pages, so content has "
-            "probably overflowed page 1. Shorten the descriptions or reduce the "
-            "number of line items in BrightManager, re-export the PDF and try again."
-        )
+    # Add a diagnosis hint. Note: a HEALTHY BrightManager fee note is
+    # 2 pages (page 2 is just the VAT footer), so page count alone is
+    # not evidence of overflow — the pattern of missing fields is.
+    if problems:
+        header_ok = bool(data.get('invoice_no')) and bool(data.get('client_name'))
+        if header_ok:
+            # Header parsed but figures/items/address didn't — the classic
+            # signature of content overflowing page 1.
+            problems.append(
+                "This usually happens when the fee note content overflows the "
+                "first page. Shorten the descriptions or reduce the number of "
+                "line items in BrightManager, re-export the PDF and try again."
+            )
+        else:
+            problems.append(
+                "This file doesn't look like a standard BrightManager fee note — "
+                "please check the right PDF was uploaded."
+            )
 
     return problems
 

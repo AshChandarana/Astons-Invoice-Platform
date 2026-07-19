@@ -142,8 +142,30 @@ def approve_draft(invoice_id: str, user_id: int, entity: str,
         monthly=monthly,
         client_code=(contact.get("AccountNumber") or "").strip() or None,
     )
+
+    # Tell the raiser(s) their fee note went through. Best-effort — a
+    # send failure never affects the approval itself.
+    import html as html_mod
+    import xero_watchdog
+    notified = []
+    emails = xero_attrib.raiser_emails(raisers)
+    if emails:
+        body = (
+            f"<p>Your fee note <b>{html_mod.escape(draft['invoice_number'] or '')}</b> "
+            f"for <b>{html_mod.escape(draft['contact_name'] or '')}</b> "
+            f"({'£' + format(draft['total'] or 0, ',.2f')}) has been approved.</p>"
+            f"<p>It is now authorised in Xero with the branded fee note "
+            f"attached to the client-facing invoice.</p>"
+        )
+        if xero_watchdog.send_email(
+            f"Fee note {draft['invoice_number']} approved", body, to=emails,
+        ):
+            notified = emails
+    db.record_xero_event(user_id, "xero_approve_notify",
+                         f"xero_invoice_id={invoice_id} "
+                         f"notified={','.join(notified) or 'none'}")
     return {"attachment_ok": attachment_ok, "error": error,
-            "invoice_number": draft["invoice_number"]}
+            "invoice_number": draft["invoice_number"], "notified": notified}
 
 
 def retry_attachment(invoice_id: str, user_id: int) -> dict:

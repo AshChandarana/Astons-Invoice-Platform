@@ -128,12 +128,22 @@ def sync_tenant(tenant_id: str) -> dict:
     started = dt.datetime.utcnow()
     try:
         # 1. Delta fetch with full detail (line items need paging).
+        #    Track which drafts are NEW to the Hub so the approver can be
+        #    emailed about fresh arrivals (one batched email per sync).
+        existing_ids = set(db.xero_ids_for_tenant(tenant_id))
         delta_params = {
             "Statuses": "DRAFT,SUBMITTED",
             "where": 'Type=="ACCREC"',
         }
         fetched = 0
+        new_drafts = []
         for inv in _fetch_paged(tenant_id, delta_params, if_modified_since=if_mod):
+            if inv["InvoiceID"] not in existing_ids:
+                new_drafts.append({
+                    "invoice_number": inv.get("InvoiceNumber") or "(no number)",
+                    "contact": (inv.get("Contact") or {}).get("Name", ""),
+                    "total": inv.get("Total"),
+                })
             _upsert_invoice(tenant_id, inv)
             fetched += 1
 
@@ -163,7 +173,8 @@ def sync_tenant(tenant_id: str) -> dict:
         db.xero_log_sync(tenant_id, ok=True, fetched=fetched,
                          message=f"{flagged} external action(s)" if flagged else None)
         return {"tenant_id": tenant_id, "ok": True,
-                "fetched": fetched, "external_actions": flagged}
+                "fetched": fetched, "external_actions": flagged,
+                "new_drafts": new_drafts}
     except Exception as exc:
         db.xero_log_sync(tenant_id, ok=False, fetched=0, message=str(exc)[:500])
         return {"tenant_id": tenant_id, "ok": False, "error": str(exc)}
@@ -181,7 +192,44 @@ def sync_all() -> list:
                          message=f"Connection refresh failed: {exc}"[:500])
     results = [sync_tenant(c["tenant_id"]) for c in db.xero_list_connections()]
     db.xero_kv_set("last_poll_at", dt.datetime.utcnow().isoformat())
+    _notify_new_drafts(results)
     return results
+
+
+def _notify_new_drafts(results: list) -> None:
+    """One batched email to the approver per sync that brought in new
+    drafts. Best-effort: a send failure never breaks the sync (it logs
+    via send_email's own error handling)."""
+    new = [d for r in results if r.get("ok") for d in r.get("new_drafts", [])]
+    if not new:
+        return
+    try:
+        import html
+        import xero_watchdog
+        rows = "".join(
+            f"<tr><td>{html.escape(d['invoice_number'])}</td>"
+            f"<td>{html.escape(d['contact'])}</td>"
+            f"<td align='right'>£{float(d['total'] or 0):,.2f}</td></tr>"
+            for d in new
+        )
+        body = (
+            f"<p>{len(new)} new fee note{'s' if len(new) != 1 else ''} "
+            f"arrived from BrightManager and "
+            f"{'are' if len(new) != 1 else 'is'} awaiting review.</p>"
+            "<table border='1' cellpadding='6' cellspacing='0' "
+            "style='border-collapse:collapse'>"
+            "<tr><th>Invoice</th><th>Client</th><th>Gross</th></tr>"
+            f"{rows}</table>"
+            f"<p><a href='{xero_watchdog._hub_url()}'>Open the review queue</a></p>"
+        )
+        xero_watchdog.send_email(
+            f"Invoice Hub: {len(new)} new fee note"
+            f"{'s' if len(new) != 1 else ''} awaiting approval",
+            body,
+        )
+    except Exception as exc:
+        db.xero_log_sync(None, ok=False, fetched=0,
+                         message=f"New-draft notification failed: {exc}"[:500])
 
 
 def maybe_sync(force: bool = False) -> list:

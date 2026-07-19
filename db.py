@@ -742,6 +742,15 @@ def xero_list_drafts(hub_status: str, limit: int = 500):
         return [dict(r) for r in rows]
 
 
+def xero_ids_for_tenant(tenant_id: str):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT invoice_id FROM xero_drafts WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchall()
+        return [r["invoice_id"] for r in rows]
+
+
 def xero_pending_ids_for_tenant(tenant_id: str):
     with get_conn() as conn:
         rows = conn.execute(

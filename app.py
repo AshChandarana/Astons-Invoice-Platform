@@ -1166,10 +1166,13 @@ def approver_xero_queue(user):
                                     f"raisers={'/'.join(raiser_choice)} "
                                     f"flags={xero_anomaly.summarise(flags)}")
                             if result["attachment_ok"]:
+                                notified = result.get("notified") or []
                                 st.session_state["xq_flash"] = (
                                     "success",
                                     f"{result['invoice_number']} authorised in Xero "
-                                    "and branded fee note attached.",
+                                    "and branded fee note attached."
+                                    + (f" Raiser notified at {', '.join(notified)}."
+                                       if notified else ""),
                                 )
                             else:
                                 st.session_state["xq_flash"] = (

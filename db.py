@@ -974,6 +974,26 @@ def xero_entity_map_set(match_type: str, match_value: str, entity) -> None:
             )
 
 
+def xero_search_fee_notes(query: str, limit: int = 50):
+    """Search approved fee notes by invoice number or client name."""
+    like = f"%{(query or '').strip()}%"
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT invoice_id, invoice_number, contact_name, total, entity,
+                   raiser_pair, date, decided_at, hub_status,
+                   branded_pdf_filename
+            FROM xero_drafts
+            WHERE hub_status IN ('APPROVED', 'APPROVED_NO_ATTACHMENT')
+              AND (invoice_number LIKE ? OR contact_name LIKE ?)
+            ORDER BY decided_at DESC
+            LIMIT ?
+            """,
+            (like, like, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def xero_count_drafts() -> dict:
     with get_conn() as conn:
         rows = conn.execute(

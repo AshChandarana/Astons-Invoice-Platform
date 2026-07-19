@@ -663,6 +663,52 @@ def team_xero_drafts(user):
                             )
 
 
+def fee_note_search(user, key_prefix="fns"):
+    """Search every approved fee note ever and download the branded PDF
+    — the Hub is the easy place to find a client-facing copy (it also
+    lives on the Xero invoice under the Files button)."""
+    st.subheader("Find a fee note")
+    st.caption(
+        "Every approved fee note is stored here permanently. Search by "
+        "client name or invoice number and download the branded PDF."
+    )
+    query = st.text_input(
+        "Search", key=f"{key_prefix}_q",
+        placeholder="Client name or invoice number...",
+        label_visibility="collapsed",
+    )
+    rows = db.xero_search_fee_notes(query) if query.strip() else \
+        db.xero_search_fee_notes("", limit=10)
+    if query.strip() and not rows:
+        st.info("No approved fee notes match that search.")
+        return
+    if not query.strip():
+        st.caption("Most recent approvals — type above to search all.")
+    for r in rows:
+        with st.container(border=True):
+            cols = st.columns([3, 2, 3, 2])
+            with cols[0]:
+                st.write(f"**{r['contact_name']}**")
+                st.caption(f"{r['invoice_number']}  |  {r['entity'] or ''}"
+                           f"  |  raised by {r['raiser_pair'] or '-'}")
+            with cols[1]:
+                st.write(fmt_money(r["total"]))
+            with cols[2]:
+                st.caption(f"Invoice date {format_date(r['date'])}\n\n"
+                           f"Approved {format_timestamp(r['decided_at'])}")
+            with cols[3]:
+                full = db.xero_get_draft(r["invoice_id"])
+                if full and full.get("branded_pdf"):
+                    st.download_button(
+                        "Fee note PDF",
+                        data=full["branded_pdf"],
+                        file_name=full["branded_pdf_filename"],
+                        mime="application/pdf",
+                        key=f"{key_prefix}_dl_{r['invoice_id']}",
+                        use_container_width=True,
+                    )
+
+
 def team_my_billing(user):
     """Team member's own billing dashboard: firm total for context plus
     their personal billed figure, target progress and fee-note list.
@@ -731,11 +777,13 @@ def team_my_billing(user):
 
 def render_team_view(user):
     sidebar_counts(user)
-    tabs = st.tabs(["Fee notes", "My billing"])
+    tabs = st.tabs(["Fee notes", "My billing", "Find fee note"])
     with tabs[0]:
         team_xero_drafts(user)
     with tabs[1]:
         team_my_billing(user)
+    with tabs[2]:
+        fee_note_search(user, key_prefix="tfns")
 
 
 # === APPROVER VIEWS ===
@@ -1954,6 +2002,7 @@ def render_approver_view(user):
     tabs = st.tabs([
         "Approvals",
         "Dashboard",
+        "Find fee note",
         "Exceptions",
         "Users",
         "Audit",
@@ -1964,12 +2013,14 @@ def render_approver_view(user):
     with tabs[1]:
         approver_dashboard(user)
     with tabs[2]:
-        approver_xero_exceptions(user)
+        fee_note_search(user, key_prefix="afns")
     with tabs[3]:
-        approver_users(user)
+        approver_xero_exceptions(user)
     with tabs[4]:
-        approver_audit(user)
+        approver_users(user)
     with tabs[5]:
+        approver_audit(user)
+    with tabs[6]:
         approver_xero_settings(user)
 
 

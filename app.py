@@ -12,6 +12,7 @@ Workflow:
 """
 
 import io
+import json
 import os
 import re
 import tempfile
@@ -24,6 +25,8 @@ import streamlit as st
 
 import db
 import auth
+import xero_client
+import xero_sync
 from generate_invoice import (
     PORTFOLIOS,
     parse_brightmanager_pdf,
@@ -43,7 +46,7 @@ STATUS_LABELS = {
 
 # === PAGE CONFIG ===
 st.set_page_config(
-    page_title="Astons Invoice Platform",
+    page_title="Astons Invoice Hub",
     page_icon="astons_logo.png",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -110,7 +113,7 @@ def header(user):
         if logo_path.exists():
             st.image(str(logo_path), width=120)
     with cols[1]:
-        st.title("Invoice Platform")
+        st.title("Invoice Hub")
         st.caption("Generate branded Astons invoices with approval workflow")
     with cols[2]:
         st.write("")
@@ -122,6 +125,16 @@ def header(user):
             auth.logout()
             st.rerun()
     st.divider()
+
+
+def fmt_money(value) -> str:
+    """Currency per SPEC.md: £ #,##0.00."""
+    if value is None or value == "":
+        return ""
+    try:
+        return f"£{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return f"£{value}"
 
 
 def sidebar_counts(user):
@@ -137,6 +150,14 @@ def sidebar_counts(user):
         st.metric("Approved (ready to send)", approved)
         st.metric("Sent", sent)
         st.metric("Rejected", rejected)
+        if user["role"] == "approver" and xero_client.is_connected():
+            xc = db.xero_count_drafts()
+            st.divider()
+            st.subheader("Xero")
+            st.metric("Drafts awaiting review", xc.get("PENDING_REVIEW", 0))
+            exceptions = xc.get("EXTERNAL_ACTION", 0)
+            if exceptions:
+                st.metric("Exceptions", exceptions)
         st.divider()
         st.caption(
             "All data on this platform stays inside Astons. "
@@ -651,34 +672,274 @@ def approver_audit(user):
             cols[3].caption(r["note"] or (f"Invoice #{r['invoice_id']}" if r["invoice_id"] else ""))
 
 
+# === XERO (SPEC.md Phase 1) ===
+
+def handle_xero_oauth_callback(user):
+    """Complete the Xero consent flow when the app is loaded with
+    ?code=...&state=... after the redirect back from Xero."""
+    params = st.query_params
+    code = params.get("code")
+    state = params.get("state")
+    if not code or not state:
+        return
+    st.query_params.clear()
+    if user["role"] != "approver":
+        st.error("Only an approver can connect Xero.")
+        return
+    try:
+        xero_client.exchange_code(code, state)
+        db.record_xero_event(user["id"], "xero_connect", "Consent flow completed")
+        names = ", ".join(
+            c["tenant_name"] for c in db.xero_list_connections()
+        ) or "no organisations"
+        st.success(f"Xero connected: {names}. Drafts will appear in the Xero queue "
+                   "after the first sync.")
+    except Exception as exc:
+        st.error(f"Xero connection failed: {exc}")
+
+
+def xero_entity_badge(draft) -> str:
+    entity = draft.get("entity")
+    if entity:
+        return entity
+    return draft.get("tenant_name") or "Untagged"
+
+
+def approver_xero_queue(user):
+    st.subheader("Xero review queue")
+    st.caption(
+        "Fee-note drafts raised in BrightManager, pulled automatically from "
+        "Xero. Approve and reject actions arrive in Phases 2–3 — for now this "
+        "queue is read-only so the pipeline can be verified against Xero."
+    )
+
+    if not xero_client.is_configured():
+        st.warning(
+            "Xero credentials are not set. Add XERO_CLIENT_ID, "
+            "XERO_CLIENT_SECRET and XERO_REDIRECT_URI as environment "
+            "variables, then connect from the Xero settings tab."
+        )
+        return
+    if not xero_client.is_connected():
+        st.info("Xero is not connected yet — go to the Xero settings tab.")
+        return
+
+    # Throttled auto-sync on page load + manual sync.
+    cols = st.columns([2, 3, 5])
+    with cols[0]:
+        force = st.button("Sync now", use_container_width=True)
+    with st.spinner("Checking Xero for new drafts..."):
+        results = xero_sync.maybe_sync(force=force)
+    failures = [r for r in results if not r.get("ok")]
+    for f in failures:
+        st.error(f"Sync failed for tenant {f['tenant_id']}: {f['error']}")
+    with cols[1]:
+        last = db.xero_last_sync_time()
+        if last:
+            st.caption(f"Last successful sync: {format_timestamp(last)} (UTC)")
+
+    drafts = db.xero_list_drafts("PENDING_REVIEW")
+    if not drafts:
+        st.success("No Xero drafts awaiting review.")
+        return
+
+    st.write(f"**{len(drafts)}** draft{'s' if len(drafts) != 1 else ''} awaiting review")
+    for d in drafts:
+        with st.container(border=True):
+            top = st.columns([3, 2, 2, 2, 2])
+            with top[0]:
+                st.write(f"**{d['contact_name'] or '(no contact)'}**")
+                st.caption(
+                    f"{d['invoice_number'] or '(no number)'}  |  "
+                    f"{xero_entity_badge(d)}  |  "
+                    f"Xero status: {d['xero_status']}"
+                )
+            with top[1]:
+                st.write(fmt_money(d["total"]))
+                st.caption(
+                    f"Net {fmt_money(d['sub_total'])} + "
+                    f"VAT {fmt_money(d['total_tax'])}"
+                )
+            with top[2]:
+                st.caption(f"Invoice date\n\n{d['date'] or '-'}")
+            with top[3]:
+                st.caption(f"Due date\n\n{d['due_date'] or '-'}")
+            with top[4]:
+                if d["reference"]:
+                    st.caption(f"Reference\n\n{d['reference']}")
+            try:
+                line_items = json.loads(d["line_items_json"] or "[]")
+            except json.JSONDecodeError:
+                line_items = []
+            if line_items:
+                with st.expander(f"Line items ({len(line_items)})"):
+                    for li in line_items:
+                        st.write(
+                            f"- {li.get('Description', '(no description)')} — "
+                            f"{fmt_money(li.get('LineAmount'))}"
+                        )
+
+
+def approver_xero_exceptions(user):
+    st.subheader("Exceptions")
+    st.caption(
+        "Drafts actioned outside the Hub (deleted or authorised directly in "
+        "Xero) and failed sync attempts. Nothing vanishes silently."
+    )
+
+    external = db.xero_list_drafts("EXTERNAL_ACTION")
+    if external:
+        st.write(f"**{len(external)}** external action{'s' if len(external) != 1 else ''}")
+        for d in external:
+            with st.container(border=True):
+                cols = st.columns([3, 2, 4, 2])
+                with cols[0]:
+                    st.write(f"**{d['contact_name'] or '(no contact)'}**")
+                    st.caption(
+                        f"{d['invoice_number'] or '(no number)'}  |  "
+                        f"{xero_entity_badge(d)}"
+                    )
+                with cols[1]:
+                    st.write(fmt_money(d["total"]))
+                with cols[2]:
+                    st.warning(d["external_action_note"] or "Actioned outside the Hub.")
+                with cols[3]:
+                    if st.button(
+                        "Dismiss",
+                        key=f"xero_dismiss_{d['invoice_id']}",
+                        use_container_width=True,
+                    ):
+                        db.xero_dismiss_draft(d["invoice_id"], user["id"])
+                        st.rerun()
+    else:
+        st.success("No external actions outstanding.")
+
+    failures = db.xero_recent_sync_failures()
+    if failures:
+        st.divider()
+        st.write("**Recent sync failures**")
+        for f in failures:
+            st.error(
+                f"{format_timestamp(f['created_at'])} — "
+                f"{f['tenant_name'] or f['tenant_id'] or 'connection'}: {f['message']}"
+            )
+
+
+def approver_xero_settings(user):
+    st.subheader("Xero settings")
+
+    if not xero_client.is_configured():
+        st.error(
+            "Xero app credentials are missing. Set these environment "
+            "variables on Railway (Variables tab), then redeploy:"
+        )
+        st.code(
+            "XERO_CLIENT_ID=<from developer.xero.com>\n"
+            "XERO_CLIENT_SECRET=<from developer.xero.com>\n"
+            "XERO_REDIRECT_URI=<this app's exact URL, as registered on the Xero app>"
+        )
+        st.caption(
+            "The Xero app needs these scopes: accounting.transactions, "
+            "accounting.attachments, accounting.contacts.read, offline_access."
+        )
+        return
+
+    if xero_client.is_connected():
+        st.success("Xero is connected.")
+        try:
+            xero_client.refresh_connections()
+        except Exception as exc:
+            st.warning(f"Could not refresh the organisation list: {exc}")
+
+        conns = db.xero_list_connections()
+        st.write("**Connected organisations** — tag each as AA or CW so the "
+                 "queue and reporting can badge by entity:")
+        for c in conns:
+            cols = st.columns([4, 3, 3])
+            with cols[0]:
+                st.write(f"**{c['tenant_name']}**")
+                st.caption(f"Tenant {c['tenant_id'][:8]}…  |  "
+                           f"Last sync: {format_timestamp(c['last_sync_at']) or 'never'}")
+            with cols[1]:
+                options = ["(untagged)", "AA", "CW"]
+                current = c["entity"] or "(untagged)"
+                choice = st.selectbox(
+                    "Entity",
+                    options,
+                    index=options.index(current),
+                    key=f"entity_{c['tenant_id']}",
+                    label_visibility="collapsed",
+                )
+                if choice != current:
+                    db.xero_set_connection_entity(
+                        c["tenant_id"], None if choice == "(untagged)" else choice
+                    )
+                    st.rerun()
+
+        st.divider()
+        cols = st.columns([2, 2, 6])
+        with cols[0]:
+            st.link_button("Reconnect / add org", xero_client.build_consent_url(),
+                           use_container_width=True)
+        with cols[1]:
+            if st.button("Disconnect Xero", use_container_width=True):
+                xero_client.disconnect()
+                db.record_xero_event(user["id"], "xero_disconnect",
+                                     "Tokens removed from Hub")
+                st.rerun()
+        st.caption(
+            "If AA and CW are a single Xero org with two branding themes, "
+            "leave one connection tagged and entity mapping by branding "
+            "theme will be added once confirmed."
+        )
+    else:
+        st.info("Xero is not connected yet.")
+        st.link_button("Connect to Xero", xero_client.build_consent_url())
+        st.caption(
+            "You'll be sent to Xero to authorise the Invoice Hub app. If AA "
+            "and CW are separate Xero organisations, run the connect flow "
+            "once and select both (or connect a second time for the other org)."
+        )
+
+
 def render_approver_view(user):
     sidebar_counts(user)
     tabs = st.tabs([
+        "Xero queue",
+        "Exceptions",
         "Pending approvals",
         "Approved",
         "Sent",
         "Rejected",
         "Users",
         "Audit",
+        "Xero settings",
     ])
     with tabs[0]:
-        approver_queue(user)
+        approver_xero_queue(user)
     with tabs[1]:
-        approver_archive(user, "approved", "Approved (awaiting send)", "No approved invoices waiting.")
+        approver_xero_exceptions(user)
     with tabs[2]:
-        approver_archive(user, "sent", "Sent", "No sent invoices yet.")
+        approver_queue(user)
     with tabs[3]:
-        approver_archive(user, "rejected", "Rejected", "No rejected invoices.")
+        approver_archive(user, "approved", "Approved (awaiting send)", "No approved invoices waiting.")
     with tabs[4]:
-        approver_users(user)
+        approver_archive(user, "sent", "Sent", "No sent invoices yet.")
     with tabs[5]:
+        approver_archive(user, "rejected", "Rejected", "No rejected invoices.")
+    with tabs[6]:
+        approver_users(user)
+    with tabs[7]:
         approver_audit(user)
+    with tabs[8]:
+        approver_xero_settings(user)
 
 
 # === MAIN ===
 
 def main():
     user = auth.require_login()
+    handle_xero_oauth_callback(user)
     header(user)
     if user["role"] == "approver":
         render_approver_view(user)

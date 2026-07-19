@@ -85,6 +85,68 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action       TEXT    NOT NULL,
     note         TEXT
 );
+
+-- === XERO INTEGRATION (SPEC.md Phase 1) ===
+
+-- Single token set per Xero app; covers all connected tenants.
+CREATE TABLE IF NOT EXISTS xero_tokens (
+    id            INTEGER PRIMARY KEY CHECK(id = 1),
+    access_token  TEXT NOT NULL,
+    refresh_token TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+-- Small key/value store for OAuth state, poll throttling, etc.
+CREATE TABLE IF NOT EXISTS xero_kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- One row per connected Xero organisation. entity is Ash's AA/CW tag.
+CREATE TABLE IF NOT EXISTS xero_connections (
+    tenant_id    TEXT PRIMARY KEY,
+    tenant_name  TEXT NOT NULL,
+    entity       TEXT CHECK(entity IN ('AA', 'CW') OR entity IS NULL),
+    connected_at TEXT NOT NULL,
+    last_sync_at TEXT
+);
+
+-- Drafts polled from Xero. Keyed on Xero's InvoiceID (SPEC 2.1).
+CREATE TABLE IF NOT EXISTS xero_drafts (
+    invoice_id           TEXT PRIMARY KEY,
+    tenant_id            TEXT NOT NULL REFERENCES xero_connections(tenant_id),
+    invoice_number       TEXT,
+    reference            TEXT,
+    contact_name         TEXT,
+    line_items_json      TEXT,
+    sub_total            REAL,
+    total_tax            REAL,
+    total                REAL,
+    date                 TEXT,
+    due_date             TEXT,
+    updated_date_utc     TEXT,
+    branding_theme_id    TEXT,
+    xero_status          TEXT,
+    hub_status           TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
+                         CHECK(hub_status IN ('PENDING_REVIEW', 'EXTERNAL_ACTION', 'DISMISSED')),
+    external_action_note TEXT,
+    first_seen_at        TEXT NOT NULL,
+    last_seen_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_xero_drafts_hub_status ON xero_drafts(hub_status);
+CREATE INDEX IF NOT EXISTS idx_xero_drafts_tenant ON xero_drafts(tenant_id);
+
+-- Every poll attempt is logged; failures surface in the exceptions tab.
+CREATE TABLE IF NOT EXISTS xero_sync_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT    NOT NULL,
+    tenant_id  TEXT,
+    ok         INTEGER NOT NULL,
+    fetched    INTEGER NOT NULL DEFAULT 0,
+    message    TEXT
+);
 """
 
 
@@ -353,6 +415,256 @@ def count_by_status() -> dict:
         return {r["status"]: r["n"] for r in rows}
 
 
+# === XERO: TOKENS & KV ===
+
+def xero_save_tokens(*, access_token: str, refresh_token: str, expires_at: str) -> None:
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO xero_tokens (id, access_token, refresh_token, expires_at, updated_at)
+            VALUES (1, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                access_token = excluded.access_token,
+                refresh_token = excluded.refresh_token,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            """,
+            (access_token, refresh_token, expires_at, now),
+        )
+
+
+def xero_get_tokens():
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM xero_tokens WHERE id = 1").fetchone()
+        return dict(row) if row else None
+
+
+def xero_delete_tokens() -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM xero_tokens")
+
+
+def xero_kv_set(key: str, value: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO xero_kv (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def xero_kv_get(key: str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM xero_kv WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def xero_kv_delete(key: str) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM xero_kv WHERE key = ?", (key,))
+
+
+# === XERO: CONNECTIONS ===
+
+def xero_upsert_connection(tenant_id: str, tenant_name: str) -> None:
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO xero_connections (tenant_id, tenant_name, connected_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tenant_id) DO UPDATE SET tenant_name = excluded.tenant_name
+            """,
+            (tenant_id, tenant_name, now),
+        )
+
+
+def xero_list_connections():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM xero_connections ORDER BY tenant_name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def xero_set_connection_entity(tenant_id: str, entity) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE xero_connections SET entity = ? WHERE tenant_id = ?",
+            (entity, tenant_id),
+        )
+
+
+def xero_set_last_sync(tenant_id: str, when_iso: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE xero_connections SET last_sync_at = ? WHERE tenant_id = ?",
+            (when_iso, tenant_id),
+        )
+
+
+# === XERO: DRAFTS ===
+
+def xero_upsert_draft(
+    *,
+    invoice_id: str,
+    tenant_id: str,
+    invoice_number: str,
+    reference: str,
+    contact_name: str,
+    line_items_json: str,
+    sub_total,
+    total_tax,
+    total,
+    date: str,
+    due_date: str,
+    updated_date_utc: str,
+    branding_theme_id: str,
+    xero_status: str,
+) -> None:
+    """Upsert one Xero draft keyed on InvoiceID. A draft that had been
+    marked EXTERNAL_ACTION but reappears as a live draft goes back to
+    PENDING_REVIEW (e.g. it was authorised then reverted in Xero)."""
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO xero_drafts (
+                invoice_id, tenant_id, invoice_number, reference, contact_name,
+                line_items_json, sub_total, total_tax, total, date, due_date,
+                updated_date_utc, branding_theme_id, xero_status,
+                hub_status, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?)
+            ON CONFLICT(invoice_id) DO UPDATE SET
+                invoice_number = excluded.invoice_number,
+                reference = excluded.reference,
+                contact_name = excluded.contact_name,
+                line_items_json = excluded.line_items_json,
+                sub_total = excluded.sub_total,
+                total_tax = excluded.total_tax,
+                total = excluded.total,
+                date = excluded.date,
+                due_date = excluded.due_date,
+                updated_date_utc = excluded.updated_date_utc,
+                branding_theme_id = excluded.branding_theme_id,
+                xero_status = excluded.xero_status,
+                hub_status = 'PENDING_REVIEW',
+                external_action_note = NULL,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                invoice_id, tenant_id, invoice_number, reference, contact_name,
+                line_items_json, sub_total, total_tax, total, date, due_date,
+                updated_date_utc, branding_theme_id, xero_status,
+                now, now,
+            ),
+        )
+
+
+def xero_touch_drafts_seen(invoice_ids: list) -> None:
+    if not invoice_ids:
+        return
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.executemany(
+            "UPDATE xero_drafts SET last_seen_at = ? WHERE invoice_id = ?",
+            [(now, iid) for iid in invoice_ids],
+        )
+
+
+def xero_list_drafts(hub_status: str, limit: int = 500):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT d.*, c.tenant_name, c.entity
+            FROM xero_drafts d
+            JOIN xero_connections c ON d.tenant_id = c.tenant_id
+            WHERE d.hub_status = ?
+            ORDER BY d.date DESC, d.invoice_number DESC
+            LIMIT ?
+            """,
+            (hub_status, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def xero_pending_ids_for_tenant(tenant_id: str):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT invoice_id FROM xero_drafts "
+            "WHERE tenant_id = ? AND hub_status = 'PENDING_REVIEW'",
+            (tenant_id,),
+        ).fetchall()
+        return [r["invoice_id"] for r in rows]
+
+
+def xero_mark_external_action(invoice_id: str, note: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE xero_drafts
+            SET hub_status = 'EXTERNAL_ACTION', external_action_note = ?
+            WHERE invoice_id = ?
+            """,
+            (note, invoice_id),
+        )
+
+
+def xero_dismiss_draft(invoice_id: str, user_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE xero_drafts SET hub_status = 'DISMISSED' WHERE invoice_id = ?",
+            (invoice_id,),
+        )
+        _write_audit(conn, user_id, None, "xero_dismiss_exception",
+                     f"xero_invoice_id={invoice_id}")
+
+
+def xero_count_drafts() -> dict:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT hub_status, COUNT(*) AS n FROM xero_drafts GROUP BY hub_status"
+        ).fetchall()
+        return {r["hub_status"]: r["n"] for r in rows}
+
+
+# === XERO: SYNC LOG ===
+
+def xero_log_sync(tenant_id, ok: bool, fetched: int, message: str = None) -> None:
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO xero_sync_log (created_at, tenant_id, ok, fetched, message) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (now, tenant_id, 1 if ok else 0, fetched, message),
+        )
+
+
+def xero_recent_sync_failures(limit: int = 20):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.*, c.tenant_name
+            FROM xero_sync_log s
+            LEFT JOIN xero_connections c ON s.tenant_id = c.tenant_id
+            WHERE s.ok = 0
+            ORDER BY s.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def xero_last_sync_time():
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(created_at) AS t FROM xero_sync_log WHERE ok = 1"
+        ).fetchone()
+        return row["t"] if row else None
+
+
 # === AUDIT ===
 
 def _write_audit(conn, user_id, invoice_id, action, note=None):
@@ -361,6 +673,11 @@ def _write_audit(conn, user_id, invoice_id, action, note=None):
         "INSERT INTO audit_log (created_at, user_id, invoice_id, action, note) VALUES (?, ?, ?, ?, ?)",
         (now, user_id, invoice_id, action, note),
     )
+
+
+def record_xero_event(user_id: int, action: str, note: str = None) -> None:
+    with get_conn() as conn:
+        _write_audit(conn, user_id, None, action, note)
 
 
 def record_login(user_id: int) -> None:

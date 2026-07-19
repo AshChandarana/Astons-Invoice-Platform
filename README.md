@@ -1,8 +1,23 @@
-# Astons Invoice Platform
+# Astons Invoice Hub
 
 Internal Astons Accountants tool with approval workflow. Team members raise fee notes in BrightManager, convert them to branded invoices here, and submit them to Ash for approval before sending to clients.
 
-This is the v2 successor to the simpler `astons-invoice-generator`, which only did the conversion step.
+This is the v2 successor to the simpler `astons-invoice-generator`, which only did the conversion step. The Xero integration build (see `SPEC.md`) is turning the Hub into the single review/approval point for all fee notes.
+
+## Xero integration (SPEC.md — Phase 1 built)
+
+Phase 1 polls Xero for BrightManager-raised ACCREC drafts and shows them in a read-only **Xero queue** for the approver, with an **Exceptions** tab for drafts actioned outside the Hub and failed syncs. Approve/reject actions come in Phases 2–3.
+
+Setup (in addition to the variables below):
+
+1. Create a Xero app at developer.xero.com (auth code flow) with redirect URI set to the app's exact URL, and scopes `accounting.transactions`, `accounting.attachments`, `accounting.contacts.read`, `offline_access`.
+2. Set env vars: `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`, `XERO_REDIRECT_URI` (must match the registered redirect URI exactly).
+3. Log in as approver → **Xero settings** tab → Connect to Xero → authorise the org(s).
+4. Tag each connected org as AA or CW in the same tab.
+
+Polling runs automatically on approver page load, throttled to every 10 minutes (DB-backed, shared across sessions), plus a **Sync now** button. For polling independent of anyone having the app open, add a Railway cron service running `python xero_sync.py` on the same volume/env.
+
+New files: `xero_client.py` (OAuth + API), `xero_sync.py` (poll engine).
 
 ## What's different from v1
 

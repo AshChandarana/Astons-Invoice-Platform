@@ -31,6 +31,7 @@ import auth
 import xero_client
 import xero_sync
 import xero_actions
+import xero_anomaly
 import xero_attrib
 import xero_pdf
 import xero_recon
@@ -812,8 +813,11 @@ def approver_xero_queue(user):
     else:
         st.success("No Xero drafts awaiting review.")
 
+    anomaly_history = xero_anomaly.load_history() if drafts else []
+
     for d in drafts:
         iid = d["invoice_id"]
+        flags = xero_anomaly.flags_for_draft(d, anomaly_history)
         with st.container(border=True):
             top = st.columns([3, 2, 2, 2, 2])
             with top[0]:
@@ -827,6 +831,13 @@ def approver_xero_queue(user):
                     st.error(f"Escalated — waiting {age} days", icon="🚨")
                 elif age >= xero_watchdog.WARN_DAYS:
                     st.warning(f"Waiting {age} days", icon="⚠️")
+                for f in flags:
+                    if f["level"] == "red":
+                        st.error(f"{f['label']}: {f['detail']}", icon="⛔")
+                    elif f["level"] == "amber":
+                        st.warning(f"{f['label']}: {f['detail']}", icon="🟠")
+                    else:
+                        st.info(f"{f['label']}: {f['detail']}", icon="ℹ️")
             with top[1]:
                 st.write(fmt_money(d["total"]))
                 st.caption(
@@ -934,6 +945,14 @@ def approver_xero_queue(user):
                                     raisers=raiser_choice,
                                     monthly=monthly_choice,
                                 )
+                            if flags:
+                                # SPEC 7.2: flag events logged so caught
+                                # errors are countable per month/raiser.
+                                db.record_xero_event(
+                                    user["id"], "anomaly_flags_at_decision",
+                                    f"xero_invoice_id={iid} decision=approve "
+                                    f"raisers={'/'.join(raiser_choice)} "
+                                    f"flags={xero_anomaly.summarise(flags)}")
                             if result["attachment_ok"]:
                                 st.session_state["xq_flash"] = (
                                     "success",
@@ -974,6 +993,11 @@ def approver_xero_queue(user):
                         try:
                             with st.spinner("Deleting draft in Xero..."):
                                 result = xero_actions.reject_draft(iid, user["id"], reason)
+                            if flags:
+                                db.record_xero_event(
+                                    user["id"], "anomaly_flags_at_decision",
+                                    f"xero_invoice_id={iid} decision=reject "
+                                    f"flags={xero_anomaly.summarise(flags)}")
                             notified = result.get("notified") or []
                             st.session_state["xq_flash"] = (
                                 "success",

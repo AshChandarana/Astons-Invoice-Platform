@@ -72,13 +72,14 @@ def _fetch_paged(tenant_id: str, params: dict, if_modified_since=None):
 
 
 def _upsert_invoice(tenant_id: str, inv: dict) -> None:
-    contact = (inv.get("Contact") or {}).get("Name", "")
+    contact = inv.get("Contact") or {}
     db.xero_upsert_draft(
         invoice_id=inv["InvoiceID"],
         tenant_id=tenant_id,
         invoice_number=inv.get("InvoiceNumber") or "",
         reference=inv.get("Reference") or "",
-        contact_name=contact,
+        contact_id=contact.get("ContactID") or "",
+        contact_name=contact.get("Name", ""),
         line_items_json=json.dumps(inv.get("LineItems", [])),
         sub_total=inv.get("SubTotal"),
         total_tax=inv.get("TotalTax"),

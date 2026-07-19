@@ -21,12 +21,19 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from datetime import timezone
+from zoneinfo import ZoneInfo
+
 import streamlit as st
 
 import db
 import auth
 import xero_client
 import xero_sync
+import xero_actions
+import xero_pdf
+
+UK_TZ = ZoneInfo("Europe/London")
 from generate_invoice import (
     PORTFOLIOS,
     parse_brightmanager_pdf,
@@ -98,10 +105,22 @@ def format_status(status: str) -> str:
 
 
 def format_timestamp(iso: str) -> str:
+    """Stored timestamps are naive UTC; display in UK time (GMT/BST)."""
     if not iso:
         return ""
     try:
-        return datetime.fromisoformat(iso).strftime("%d %b %Y %H:%M")
+        stamp = datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+        return stamp.astimezone(UK_TZ).strftime("%d %b %Y %H:%M")
+    except Exception:
+        return iso
+
+
+def format_date(iso: str) -> str:
+    """'2026-07-01T00:00:00' -> '01 Jul 2026'."""
+    if not iso:
+        return "-"
+    try:
+        return datetime.fromisoformat(iso[:10]).strftime("%d %b %Y")
     except Exception:
         return iso
 
@@ -714,12 +733,29 @@ def xero_entity_badge(draft) -> str:
     return draft.get("tenant_name") or "Untagged"
 
 
+REJECT_REASONS = ["Wrong amount", "Wrong client", "Wrong narrative", "Duplicate", "Other"]
+
+ENTITY_LABELS = {
+    "AA": "AA — bank 60-83-71 / 19010489 (A-portfolio)",
+    "CW": "CW — bank 04-13-76 / 00273335 (C-portfolio)",
+}
+
+
+def show_flash(key: str):
+    flash = st.session_state.pop(key, None)
+    if flash:
+        kind, msg = flash
+        {"success": st.success, "error": st.error, "warning": st.warning}[kind](msg)
+
+
 def approver_xero_queue(user):
     st.subheader("Xero review queue")
+    show_flash("xq_flash")
     st.caption(
         "Fee-note drafts raised in BrightManager, pulled automatically from "
-        "Xero. Approve and reject actions arrive in Phases 2–3 — for now this "
-        "queue is read-only so the pipeline can be verified against Xero."
+        "Xero. Approve sets the invoice to AUTHORISED in Xero and attaches "
+        "the branded fee note; Reject deletes the draft in Xero — no "
+        "duplicate actions needed in Xero itself."
     )
 
     if not xero_client.is_configured():
@@ -745,22 +781,23 @@ def approver_xero_queue(user):
     with cols[1]:
         last = db.xero_last_sync_time()
         if last:
-            st.caption(f"Last successful sync: {format_timestamp(last)} (UTC)")
+            st.caption(f"Last successful sync: {format_timestamp(last)}")
 
+    entity_map = db.xero_entity_map_all()
     drafts = db.xero_list_drafts("PENDING_REVIEW")
-    if not drafts:
+    if drafts:
+        st.write(f"**{len(drafts)}** draft{'s' if len(drafts) != 1 else ''} awaiting review")
+    else:
         st.success("No Xero drafts awaiting review.")
-        return
 
-    st.write(f"**{len(drafts)}** draft{'s' if len(drafts) != 1 else ''} awaiting review")
     for d in drafts:
+        iid = d["invoice_id"]
         with st.container(border=True):
             top = st.columns([3, 2, 2, 2, 2])
             with top[0]:
                 st.write(f"**{d['contact_name'] or '(no contact)'}**")
                 st.caption(
                     f"{d['invoice_number'] or '(no number)'}  |  "
-                    f"{xero_entity_badge(d)}  |  "
                     f"Xero status: {d['xero_status']}"
                 )
             with top[1]:
@@ -770,12 +807,13 @@ def approver_xero_queue(user):
                     f"VAT {fmt_money(d['total_tax'])}"
                 )
             with top[2]:
-                st.caption(f"Invoice date\n\n{d['date'] or '-'}")
+                st.caption(f"Invoice date\n\n{format_date(d['date'])}")
             with top[3]:
-                st.caption(f"Due date\n\n{d['due_date'] or '-'}")
+                st.caption(f"Due date\n\n{format_date(d['due_date'])}")
             with top[4]:
                 if d["reference"]:
                     st.caption(f"Reference\n\n{d['reference']}")
+
             try:
                 line_items = json.loads(d["line_items_json"] or "[]")
             except json.JSONDecodeError:
@@ -783,18 +821,187 @@ def approver_xero_queue(user):
             if line_items:
                 with st.expander(f"Line items ({len(line_items)})"):
                     for li in line_items:
+                        tracking = ", ".join(
+                            f"{t.get('Name')}: {t.get('Option')}"
+                            for t in (li.get("Tracking") or [])
+                        )
+                        extra = f"  ·  nominal {li.get('AccountCode')}" if li.get("AccountCode") else ""
+                        extra += f"  ·  {tracking}" if tracking else ""
                         st.write(
                             f"- {li.get('Description', '(no description)')} — "
-                            f"{fmt_money(li.get('LineAmount'))}"
+                            f"{fmt_money(li.get('LineAmount'))}{extra}"
                         )
+
+            # --- Actions ---
+            derived = xero_pdf.derive_entity(d, entity_map)
+            action_cols = st.columns([3, 2, 2, 3])
+            with action_cols[0]:
+                options = ["AA", "CW"]
+                entity_choice = st.selectbox(
+                    "Entity (sets bank details on the fee note)",
+                    options,
+                    index=options.index(derived) if derived else None,
+                    format_func=lambda e: ENTITY_LABELS[e],
+                    placeholder="Select AA or CW...",
+                    key=f"xq_entity_{iid}",
+                )
+                if derived:
+                    st.caption(f"Auto-detected {derived} from tracking/nominals.")
+            with action_cols[1]:
+                if st.button("Approve", key=f"xq_app_{iid}", type="primary",
+                             use_container_width=True):
+                    st.session_state[f"xq_confirm_app_{iid}"] = True
+                    st.session_state.pop(f"xq_confirm_rej_{iid}", None)
+            with action_cols[2]:
+                if st.button("Reject", key=f"xq_rej_{iid}", use_container_width=True):
+                    st.session_state[f"xq_confirm_rej_{iid}"] = True
+                    st.session_state.pop(f"xq_confirm_app_{iid}", None)
+
+            if st.session_state.get(f"xq_confirm_app_{iid}"):
+                if not entity_choice:
+                    st.error("Choose AA or CW first — it decides which bank "
+                             "details print on the fee note.")
+                else:
+                    st.warning(
+                        f"This will set **{d['invoice_number']}** "
+                        f"({d['contact_name']}, {fmt_money(d['total'])}) to "
+                        f"AUTHORISED in Xero and attach the branded "
+                        f"{entity_choice} fee note to the client-facing invoice."
+                    )
+                    ccols = st.columns([2, 2, 6])
+                    if ccols[0].button("Confirm approve", key=f"xq_capp_{iid}",
+                                       type="primary", use_container_width=True):
+                        try:
+                            with st.spinner("Authorising in Xero and attaching PDF..."):
+                                result = xero_actions.approve_draft(iid, user["id"], entity_choice)
+                            if result["attachment_ok"]:
+                                st.session_state["xq_flash"] = (
+                                    "success",
+                                    f"{result['invoice_number']} authorised in Xero "
+                                    "and branded fee note attached.",
+                                )
+                            else:
+                                st.session_state["xq_flash"] = (
+                                    "error",
+                                    f"{result['invoice_number']} was AUTHORISED but the "
+                                    f"attachment failed: {result['error']} — it is "
+                                    "flagged in the Exceptions tab with a retry button.",
+                                )
+                            st.session_state.pop(f"xq_confirm_app_{iid}", None)
+                            st.rerun()
+                        except xero_actions.ActionBlocked as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(f"Approve failed before any Xero change: {exc}")
+                    if ccols[1].button("Cancel", key=f"xq_capp_no_{iid}",
+                                       use_container_width=True):
+                        st.session_state.pop(f"xq_confirm_app_{iid}", None)
+                        st.rerun()
+
+            if st.session_state.get(f"xq_confirm_rej_{iid}"):
+                rcols = st.columns([3, 4, 2, 2])
+                reason_pick = rcols[0].selectbox(
+                    "Reason", REJECT_REASONS, key=f"xq_reason_{iid}")
+                note = rcols[1].text_input(
+                    "Details (required for Other)", key=f"xq_rnote_{iid}",
+                    placeholder="e.g. VAT missing / should be £1,200 not £120")
+                if rcols[2].button("Confirm reject", key=f"xq_crej_{iid}",
+                                   use_container_width=True):
+                    if reason_pick == "Other" and not note.strip():
+                        st.error("Please add details for an 'Other' rejection.")
+                    else:
+                        reason = reason_pick + (f" — {note.strip()}" if note.strip() else "")
+                        try:
+                            with st.spinner("Deleting draft in Xero..."):
+                                result = xero_actions.reject_draft(iid, user["id"], reason)
+                            st.session_state["xq_flash"] = (
+                                "success",
+                                f"{result['invoice_number']} deleted in Xero. "
+                                "The raiser should amend and re-raise in BrightManager.",
+                            )
+                            st.session_state.pop(f"xq_confirm_rej_{iid}", None)
+                            st.rerun()
+                        except xero_actions.ActionBlocked as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(f"Reject failed: {exc}")
+                if rcols[3].button("Cancel", key=f"xq_crej_no_{iid}",
+                                   use_container_width=True):
+                    st.session_state.pop(f"xq_confirm_rej_{iid}", None)
+                    st.rerun()
+
+    # --- Recently actioned ---
+    actioned = db.xero_recent_actioned()
+    if actioned:
+        with st.expander(f"Recently actioned ({len(actioned)})"):
+            for a in actioned:
+                cols2 = st.columns([3, 2, 3, 2])
+                with cols2[0]:
+                    st.write(f"**{a['contact_name']}**")
+                    st.caption(a["invoice_number"] or "")
+                with cols2[1]:
+                    st.write(fmt_money(a["total"]))
+                    st.caption(a["entity"] or "")
+                with cols2[2]:
+                    if a["hub_status"] == "APPROVED":
+                        st.success("Approved", icon="✅")
+                    elif a["hub_status"] == "APPROVED_NO_ATTACHMENT":
+                        st.warning("Approved — attachment failed (see Exceptions)")
+                    else:
+                        st.error(f"Rejected — awaiting re-raise: {a['reject_reason']}")
+                    st.caption(
+                        f"{format_timestamp(a['decided_at'])} by {a['decided_by_name'] or '-'}"
+                    )
+                with cols2[3]:
+                    if a["hub_status"].startswith("APPROVED"):
+                        full = db.xero_get_draft(a["invoice_id"])
+                        if full and full.get("branded_pdf"):
+                            st.download_button(
+                                "Fee note PDF",
+                                data=full["branded_pdf"],
+                                file_name=full["branded_pdf_filename"],
+                                mime="application/pdf",
+                                key=f"xq_dl_{a['invoice_id']}",
+                                use_container_width=True,
+                            )
 
 
 def approver_xero_exceptions(user):
     st.subheader("Exceptions")
+    show_flash("xe_flash")
     st.caption(
         "Drafts actioned outside the Hub (deleted or authorised directly in "
         "Xero) and failed sync attempts. Nothing vanishes silently."
     )
+
+    no_attach = db.xero_list_drafts("APPROVED_NO_ATTACHMENT")
+    if no_attach:
+        st.write(f"**{len(no_attach)}** authorised without attachment — retry needed")
+        for d in no_attach:
+            with st.container(border=True):
+                cols = st.columns([3, 2, 4, 2])
+                with cols[0]:
+                    st.write(f"**{d['contact_name']}**")
+                    st.caption(d["invoice_number"] or "")
+                with cols[1]:
+                    st.write(fmt_money(d["total"]))
+                with cols[2]:
+                    st.error(
+                        "AUTHORISED in Xero but the branded fee note failed to "
+                        f"attach: {d['action_error']}"
+                    )
+                with cols[3]:
+                    if st.button("Retry attachment", key=f"xe_retry_{d['invoice_id']}",
+                                 type="primary", use_container_width=True):
+                        result = xero_actions.retry_attachment(d["invoice_id"], user["id"])
+                        if result["ok"]:
+                            st.session_state["xe_flash"] = (
+                                "success", f"{d['invoice_number']}: fee note attached.")
+                        else:
+                            st.session_state["xe_flash"] = (
+                                "error", f"{d['invoice_number']}: still failing — {result['error']}")
+                        st.rerun()
+        st.divider()
 
     external = db.xero_list_drafts("EXTERNAL_ACTION")
     if external:
@@ -896,11 +1103,46 @@ def approver_xero_settings(user):
                 db.record_xero_event(user["id"], "xero_disconnect",
                                      "Tokens removed from Hub")
                 st.rerun()
+        st.divider()
+        st.write("**AA/CW entity mapping**")
         st.caption(
-            "If AA and CW are a single Xero org with two branding themes, "
-            "leave one connection tagged and entity mapping by branding "
-            "theme will be added once confirmed."
+            "AA and CW live in one Xero org, so the Hub derives each "
+            "draft's entity from line-item tracking options and nominal "
+            "codes. Map the values seen in synced drafts below; drafts "
+            "whose signals all point one way get their entity pre-selected "
+            "at review (you can always override per invoice)."
         )
+        tracking_seen, accounts_seen = set(), set()
+        for d in (db.xero_list_drafts("PENDING_REVIEW", limit=1000)
+                  + db.xero_recent_actioned(limit=200)):
+            full = d if "line_items_json" in d else db.xero_get_draft(d["invoice_id"])
+            sig = xero_pdf.draft_signals(full)
+            tracking_seen.update(sig["tracking"])
+            accounts_seen.update(sig["accounts"])
+        entity_map = {(m["match_type"], m["match_value"]): m["entity"]
+                      for m in db.xero_entity_map_all()}
+        map_options = ["(unmapped)", "AA", "CW"]
+        for match_type, values, label in [
+            ("tracking", sorted(tracking_seen), "Tracking option"),
+            ("account", sorted(accounts_seen), "Nominal code"),
+        ]:
+            for val in values:
+                cols = st.columns([4, 3, 3])
+                cols[0].write(f"{label}: **{val}**")
+                current = entity_map.get((match_type, val), "(unmapped)")
+                choice = cols[1].selectbox(
+                    "Entity", map_options,
+                    index=map_options.index(current),
+                    key=f"emap_{match_type}_{val}",
+                    label_visibility="collapsed",
+                )
+                if choice != current:
+                    db.xero_entity_map_set(
+                        match_type, val, None if choice == "(unmapped)" else choice
+                    )
+                    st.rerun()
+        if not tracking_seen and not accounts_seen:
+            st.info("No tracking options or nominal codes seen in synced drafts yet.")
     else:
         st.info("Xero is not connected yet.")
         st.link_button("Connect to Xero", xero_client.build_consent_url())

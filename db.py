@@ -44,6 +44,47 @@ def get_conn():
 
 # === SCHEMA ===
 
+# xero_drafts hub_status lifecycle:
+#   PENDING_REVIEW          - awaiting Ash's decision in the Xero queue
+#   APPROVED                - AUTHORISED in Xero + branded PDF attached
+#   APPROVED_NO_ATTACHMENT  - AUTHORISED in Xero but the attachment failed
+#                             (visible flag per SPEC 2.2; retryable)
+#   REJECTED                - DELETED in Xero, reason recorded
+#   EXTERNAL_ACTION         - actioned outside the Hub (SPEC 2.1)
+#   DISMISSED               - external action acknowledged by Ash
+XERO_DRAFTS_CREATE = """
+CREATE TABLE IF NOT EXISTS xero_drafts (
+    invoice_id           TEXT PRIMARY KEY,
+    tenant_id            TEXT NOT NULL REFERENCES xero_connections(tenant_id),
+    invoice_number       TEXT,
+    reference            TEXT,
+    contact_id           TEXT,
+    contact_name         TEXT,
+    line_items_json      TEXT,
+    sub_total            REAL,
+    total_tax            REAL,
+    total                REAL,
+    date                 TEXT,
+    due_date             TEXT,
+    updated_date_utc     TEXT,
+    branding_theme_id    TEXT,
+    xero_status          TEXT,
+    hub_status           TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
+                         CHECK(hub_status IN ('PENDING_REVIEW', 'EXTERNAL_ACTION', 'DISMISSED',
+                                              'APPROVED', 'APPROVED_NO_ATTACHMENT', 'REJECTED')),
+    external_action_note TEXT,
+    entity               TEXT CHECK(entity IN ('AA', 'CW') OR entity IS NULL),
+    decided_by_user_id   INTEGER REFERENCES users(id),
+    decided_at           TEXT,
+    reject_reason        TEXT,
+    action_error         TEXT,
+    branded_pdf          BLOB,
+    branded_pdf_filename TEXT,
+    first_seen_at        TEXT NOT NULL,
+    last_seen_at         TEXT NOT NULL
+)
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,30 +154,21 @@ CREATE TABLE IF NOT EXISTS xero_connections (
 );
 
 -- Drafts polled from Xero. Keyed on Xero's InvoiceID (SPEC 2.1).
-CREATE TABLE IF NOT EXISTS xero_drafts (
-    invoice_id           TEXT PRIMARY KEY,
-    tenant_id            TEXT NOT NULL REFERENCES xero_connections(tenant_id),
-    invoice_number       TEXT,
-    reference            TEXT,
-    contact_name         TEXT,
-    line_items_json      TEXT,
-    sub_total            REAL,
-    total_tax            REAL,
-    total                REAL,
-    date                 TEXT,
-    due_date             TEXT,
-    updated_date_utc     TEXT,
-    branding_theme_id    TEXT,
-    xero_status          TEXT,
-    hub_status           TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
-                         CHECK(hub_status IN ('PENDING_REVIEW', 'EXTERNAL_ACTION', 'DISMISSED')),
-    external_action_note TEXT,
-    first_seen_at        TEXT NOT NULL,
-    last_seen_at         TEXT NOT NULL
-);
+-- Definition lives in XERO_DRAFTS_CREATE so the v2 migration can rebuild
+-- the table with the same DDL (SQLite cannot alter CHECK constraints).
+%(xero_drafts_create)s
 
 CREATE INDEX IF NOT EXISTS idx_xero_drafts_hub_status ON xero_drafts(hub_status);
 CREATE INDEX IF NOT EXISTS idx_xero_drafts_tenant ON xero_drafts(tenant_id);
+
+-- AA/CW entity derivation for the single-org setup: line-item tracking
+-- options and account codes map to an entity (SPEC section 5).
+CREATE TABLE IF NOT EXISTS xero_entity_map (
+    match_type  TEXT NOT NULL CHECK(match_type IN ('tracking', 'account')),
+    match_value TEXT NOT NULL,
+    entity      TEXT NOT NULL CHECK(entity IN ('AA', 'CW')),
+    PRIMARY KEY (match_type, match_value)
+);
 
 -- Every poll attempt is logged; failures surface in the exceptions tab.
 CREATE TABLE IF NOT EXISTS xero_sync_log (
@@ -147,13 +179,45 @@ CREATE TABLE IF NOT EXISTS xero_sync_log (
     fetched    INTEGER NOT NULL DEFAULT 0,
     message    TEXT
 );
-"""
+""" % {"xero_drafts_create": XERO_DRAFTS_CREATE + ";"}
+
+
+def _migrate_xero_drafts_v2(conn) -> None:
+    """Rebuild xero_drafts for the Phase 2/3 statuses and decision
+    columns. SQLite can't alter CHECK constraints, so an existing table
+    created before 'APPROVED' was a valid status is renamed, recreated
+    with the current DDL, and its rows copied across."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='xero_drafts'"
+    ).fetchone()
+    if not row or "'APPROVED'" in row["sql"]:
+        return
+
+    conn.execute("ALTER TABLE xero_drafts RENAME TO xero_drafts_old")
+    conn.execute(XERO_DRAFTS_CREATE.replace("IF NOT EXISTS ", ""))
+    common = (
+        "invoice_id, tenant_id, invoice_number, reference, contact_name, "
+        "line_items_json, sub_total, total_tax, total, date, due_date, "
+        "updated_date_utc, branding_theme_id, xero_status, hub_status, "
+        "external_action_note, first_seen_at, last_seen_at"
+    )
+    conn.execute(
+        f"INSERT INTO xero_drafts ({common}) SELECT {common} FROM xero_drafts_old"
+    )
+    conn.execute("DROP TABLE xero_drafts_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_xero_drafts_hub_status ON xero_drafts(hub_status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_xero_drafts_tenant ON xero_drafts(tenant_id)"
+    )
 
 
 def init_db() -> None:
     """Create tables if they don't exist. Safe to call on every app boot."""
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate_xero_drafts_v2(conn)
 
     # Seed initial approver if DB has no users at all
     seed_initial_user_if_empty()
@@ -512,6 +576,7 @@ def xero_upsert_draft(
     tenant_id: str,
     invoice_number: str,
     reference: str,
+    contact_id: str,
     contact_name: str,
     line_items_json: str,
     sub_total,
@@ -524,21 +589,24 @@ def xero_upsert_draft(
     xero_status: str,
 ) -> None:
     """Upsert one Xero draft keyed on InvoiceID. A draft that had been
-    marked EXTERNAL_ACTION but reappears as a live draft goes back to
-    PENDING_REVIEW (e.g. it was authorised then reverted in Xero)."""
+    marked EXTERNAL_ACTION or DISMISSED but reappears as a live draft
+    goes back to PENDING_REVIEW (e.g. authorised then reverted in Xero).
+    Decided rows (APPROVED*/REJECTED) keep their decision — data fields
+    update but the Hub's verdict is never clobbered by a poll."""
     now = dt.datetime.utcnow().isoformat()
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO xero_drafts (
-                invoice_id, tenant_id, invoice_number, reference, contact_name,
-                line_items_json, sub_total, total_tax, total, date, due_date,
-                updated_date_utc, branding_theme_id, xero_status,
+                invoice_id, tenant_id, invoice_number, reference, contact_id,
+                contact_name, line_items_json, sub_total, total_tax, total,
+                date, due_date, updated_date_utc, branding_theme_id, xero_status,
                 hub_status, first_seen_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?)
             ON CONFLICT(invoice_id) DO UPDATE SET
                 invoice_number = excluded.invoice_number,
                 reference = excluded.reference,
+                contact_id = excluded.contact_id,
                 contact_name = excluded.contact_name,
                 line_items_json = excluded.line_items_json,
                 sub_total = excluded.sub_total,
@@ -549,14 +617,20 @@ def xero_upsert_draft(
                 updated_date_utc = excluded.updated_date_utc,
                 branding_theme_id = excluded.branding_theme_id,
                 xero_status = excluded.xero_status,
-                hub_status = 'PENDING_REVIEW',
-                external_action_note = NULL,
+                hub_status = CASE
+                    WHEN xero_drafts.hub_status IN ('EXTERNAL_ACTION', 'DISMISSED')
+                    THEN 'PENDING_REVIEW'
+                    ELSE xero_drafts.hub_status END,
+                external_action_note = CASE
+                    WHEN xero_drafts.hub_status IN ('EXTERNAL_ACTION', 'DISMISSED')
+                    THEN NULL
+                    ELSE xero_drafts.external_action_note END,
                 last_seen_at = excluded.last_seen_at
             """,
             (
-                invoice_id, tenant_id, invoice_number, reference, contact_name,
-                line_items_json, sub_total, total_tax, total, date, due_date,
-                updated_date_utc, branding_theme_id, xero_status,
+                invoice_id, tenant_id, invoice_number, reference, contact_id,
+                contact_name, line_items_json, sub_total, total_tax, total,
+                date, due_date, updated_date_utc, branding_theme_id, xero_status,
                 now, now,
             ),
         )
@@ -619,6 +693,121 @@ def xero_dismiss_draft(invoice_id: str, user_id: int) -> None:
         )
         _write_audit(conn, user_id, None, "xero_dismiss_exception",
                      f"xero_invoice_id={invoice_id}")
+
+
+def xero_get_draft(invoice_id: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT d.*, c.tenant_name, c.entity AS tenant_entity
+            FROM xero_drafts d
+            JOIN xero_connections c ON d.tenant_id = c.tenant_id
+            WHERE d.invoice_id = ?
+            """,
+            (invoice_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def xero_mark_approved(invoice_id: str, user_id: int, entity: str,
+                       pdf_bytes: bytes, pdf_filename: str,
+                       attachment_ok: bool, error: str = None) -> None:
+    now = dt.datetime.utcnow().isoformat()
+    status = "APPROVED" if attachment_ok else "APPROVED_NO_ATTACHMENT"
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE xero_drafts
+            SET hub_status = ?, entity = ?, decided_by_user_id = ?, decided_at = ?,
+                action_error = ?, branded_pdf = ?, branded_pdf_filename = ?,
+                xero_status = 'AUTHORISED'
+            WHERE invoice_id = ?
+            """,
+            (status, entity, user_id, now, error, pdf_bytes, pdf_filename, invoice_id),
+        )
+        _write_audit(conn, user_id, None, "xero_approve",
+                     f"xero_invoice_id={invoice_id} entity={entity} "
+                     f"attachment={'ok' if attachment_ok else 'FAILED: ' + str(error)}")
+
+
+def xero_mark_attachment_retried(invoice_id: str, user_id: int,
+                                 ok: bool, error: str = None) -> None:
+    with get_conn() as conn:
+        if ok:
+            conn.execute(
+                "UPDATE xero_drafts SET hub_status = 'APPROVED', action_error = NULL "
+                "WHERE invoice_id = ?",
+                (invoice_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE xero_drafts SET action_error = ? WHERE invoice_id = ?",
+                (error, invoice_id),
+            )
+        _write_audit(conn, user_id, None, "xero_attachment_retry",
+                     f"xero_invoice_id={invoice_id} {'ok' if ok else 'failed: ' + str(error)}")
+
+
+def xero_mark_rejected(invoice_id: str, user_id: int, reason: str) -> None:
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE xero_drafts
+            SET hub_status = 'REJECTED', decided_by_user_id = ?, decided_at = ?,
+                reject_reason = ?, xero_status = 'DELETED'
+            WHERE invoice_id = ?
+            """,
+            (user_id, now, reason, invoice_id),
+        )
+        _write_audit(conn, user_id, None, "xero_reject",
+                     f"xero_invoice_id={invoice_id} reason={reason}")
+
+
+def xero_recent_actioned(limit: int = 50):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT d.invoice_id, d.invoice_number, d.contact_name, d.total,
+                   d.hub_status, d.entity, d.decided_at, d.reject_reason,
+                   d.action_error, d.branded_pdf_filename,
+                   u.full_name AS decided_by_name
+            FROM xero_drafts d
+            LEFT JOIN users u ON d.decided_by_user_id = u.id
+            WHERE d.hub_status IN ('APPROVED', 'APPROVED_NO_ATTACHMENT', 'REJECTED')
+            ORDER BY d.decided_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# === XERO: ENTITY MAP (AA/CW from tracking options / account codes) ===
+
+def xero_entity_map_all():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM xero_entity_map").fetchall()
+        return [dict(r) for r in rows]
+
+
+def xero_entity_map_set(match_type: str, match_value: str, entity) -> None:
+    """entity None removes the mapping."""
+    with get_conn() as conn:
+        if entity is None:
+            conn.execute(
+                "DELETE FROM xero_entity_map WHERE match_type = ? AND match_value = ?",
+                (match_type, match_value),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO xero_entity_map (match_type, match_value, entity)
+                VALUES (?, ?, ?)
+                ON CONFLICT(match_type, match_value) DO UPDATE SET entity = excluded.entity
+                """,
+                (match_type, match_value, entity),
+            )
 
 
 def xero_count_drafts() -> dict:

@@ -224,14 +224,11 @@ def refresh_connections() -> list:
 
 # === API CALLS ===
 
-def api_get(tenant_id: str, path: str, params: dict = None,
-            if_modified_since: str = None) -> dict:
-    """GET against the accounting API for one tenant, with 429 back-off
-    and one automatic re-auth attempt on 401.
-
-    if_modified_since: HTTP-date string (RFC 7231) or None.
-    Returns parsed JSON. 304 Not Modified returns {} (no changes).
-    """
+def _request(method: str, tenant_id: str, path: str, *, params: dict = None,
+             json_payload: dict = None, data: bytes = None,
+             content_type: str = None, if_modified_since: str = None) -> dict:
+    """One accounting-API call for one tenant, with 429 back-off and one
+    automatic re-auth attempt on 401. 304 Not Modified returns {}."""
     url = f"{API_BASE}/{path.lstrip('/')}"
     attempts_401 = 0
     for attempt in range(MAX_429_RETRIES + 1):
@@ -242,9 +239,14 @@ def api_get(tenant_id: str, path: str, params: dict = None,
         }
         if if_modified_since:
             headers["If-Modified-Since"] = if_modified_since
-        resp = requests.get(url, headers=headers, params=params or {}, timeout=60)
+        if content_type:
+            headers["Content-Type"] = content_type
+        resp = requests.request(
+            method, url, headers=headers, params=params or {},
+            json=json_payload, data=data, timeout=60,
+        )
 
-        if resp.status_code == 200:
+        if resp.status_code in (200, 201):
             return resp.json()
         if resp.status_code == 304:
             return {}
@@ -257,6 +259,29 @@ def api_get(tenant_id: str, path: str, params: dict = None,
             time.sleep(min(wait, 60))
             continue
         raise XeroApiError(
-            f"GET {path} failed ({resp.status_code}): {resp.text[:300]}"
+            f"{method} {path} failed ({resp.status_code}): {resp.text[:300]}"
         )
-    raise XeroApiError(f"GET {path}: rate-limit retries exhausted (429).")
+    raise XeroApiError(f"{method} {path}: rate-limit retries exhausted (429).")
+
+
+def api_get(tenant_id: str, path: str, params: dict = None,
+            if_modified_since: str = None) -> dict:
+    return _request("GET", tenant_id, path, params=params,
+                    if_modified_since=if_modified_since)
+
+
+def api_post(tenant_id: str, path: str, payload: dict) -> dict:
+    return _request("POST", tenant_id, path, json_payload=payload)
+
+
+def api_put_attachment(tenant_id: str, invoice_id: str, filename: str,
+                       pdf_bytes: bytes, include_online: bool = True) -> dict:
+    """Upload a PDF attachment to an invoice. IncludeOnline=true makes it
+    visible on the client's online invoice link and Xero emails (SPEC 2.2)."""
+    return _request(
+        "PUT", tenant_id,
+        f"Invoices/{invoice_id}/Attachments/{filename}",
+        params={"IncludeOnline": "true"} if include_online else None,
+        data=pdf_bytes,
+        content_type="application/pdf",
+    )

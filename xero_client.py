@@ -19,8 +19,9 @@ immediately after each refresh.
 
 import base64
 import datetime as dt
+import hashlib
+import hmac
 import os
-import secrets
 import time
 from urllib.parse import urlencode
 
@@ -75,16 +76,36 @@ def is_connected() -> bool:
 
 # === OAUTH FLOW ===
 
+STATE_MAX_AGE_SECONDS = 15 * 60
+
+
+def _sign_state(timestamp: str) -> str:
+    """HMAC the timestamp with the client secret. Signed state means the
+    OAuth callback can be validated and completed before anyone logs in
+    (the redirect back from Xero always starts a fresh session), while
+    still proving the flow originated from this app's config."""
+    digest = hmac.new(
+        client_secret().encode("utf-8"),
+        f"xero-connect:{timestamp}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest[:32]
+
+
+def _validate_state(state: str) -> bool:
+    try:
+        timestamp, signature = state.split(".", 1)
+        age = time.time() - int(timestamp)
+    except (ValueError, TypeError):
+        return False
+    if age < 0 or age > STATE_MAX_AGE_SECONDS:
+        return False
+    return hmac.compare_digest(signature, _sign_state(timestamp))
+
+
 def build_consent_url() -> str:
-    """Build the Xero consent URL. The state value is stored in the DB
-    (not session state) because the round-trip to Xero starts a fresh
-    Streamlit session."""
-    state = secrets.token_urlsafe(24)
-    db.xero_kv_set("oauth_state", state)
-    db.xero_kv_set(
-        "oauth_state_expires",
-        (dt.datetime.utcnow() + dt.timedelta(minutes=15)).isoformat(),
-    )
+    timestamp = str(int(time.time()))
+    state = f"{timestamp}.{_sign_state(timestamp)}"
     params = {
         "response_type": "code",
         "client_id": client_id(),
@@ -114,18 +135,11 @@ def _store_token_response(payload: dict) -> None:
 def exchange_code(code: str, state: str) -> None:
     """Complete the consent flow: swap the auth code for tokens and
     record the connected tenants."""
-    saved_state = db.xero_kv_get("oauth_state")
-    expires = db.xero_kv_get("oauth_state_expires")
-    db.xero_kv_delete("oauth_state")
-    db.xero_kv_delete("oauth_state_expires")
-
-    if not saved_state or state != saved_state:
+    if not _validate_state(state):
         raise XeroAuthError(
-            "OAuth state mismatch — the connect link may have expired. "
-            "Start the connection again from Xero settings."
+            "OAuth state invalid or expired — start the connection again "
+            "from Xero settings."
         )
-    if expires and dt.datetime.utcnow().isoformat() > expires:
-        raise XeroAuthError("Connect link expired — start the connection again.")
 
     resp = requests.post(
         TOKEN_URL,

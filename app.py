@@ -674,27 +674,36 @@ def approver_audit(user):
 
 # === XERO (SPEC.md Phase 1) ===
 
-def handle_xero_oauth_callback(user):
+def handle_xero_oauth_callback():
     """Complete the Xero consent flow when the app is loaded with
-    ?code=...&state=... after the redirect back from Xero."""
+    ?code=...&state=... after the redirect back from Xero.
+
+    Runs before login: the redirect back from Xero always starts a fresh
+    browser session, so requiring login first would strand the flow at
+    the sign-in form. The HMAC-signed state (see xero_client) proves the
+    consent link was generated from this app's configuration."""
     params = st.query_params
     code = params.get("code")
     state = params.get("state")
     if not code or not state:
         return
     st.query_params.clear()
-    if user["role"] != "approver":
-        st.error("Only an approver can connect Xero.")
-        return
     try:
         xero_client.exchange_code(code, state)
-        db.record_xero_event(user["id"], "xero_connect", "Consent flow completed")
+        db.record_xero_event(None, "xero_connect", "Consent flow completed")
         names = ", ".join(
             c["tenant_name"] for c in db.xero_list_connections()
         ) or "no organisations"
-        st.success(f"Xero connected: {names}. Drafts will appear in the Xero queue "
-                   "after the first sync.")
+        print(f"Xero connected: {names}", flush=True)
+        results = xero_sync.sync_all()
+        print(f"Xero initial sync: {results}", flush=True)
+        fetched = sum(r.get("fetched", 0) for r in results if r.get("ok"))
+        st.success(
+            f"Xero connected: {names}. Initial sync pulled {fetched} "
+            f"draft{'s' if fetched != 1 else ''}. Sign in to review the queue."
+        )
     except Exception as exc:
+        print(f"Xero connect failed: {exc}", flush=True)
         st.error(f"Xero connection failed: {exc}")
 
 
@@ -938,8 +947,8 @@ def render_approver_view(user):
 # === MAIN ===
 
 def main():
+    handle_xero_oauth_callback()
     user = auth.require_login()
-    handle_xero_oauth_callback(user)
     header(user)
     if user["role"] == "approver":
         render_approver_view(user)

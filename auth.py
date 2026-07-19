@@ -30,7 +30,7 @@ def _login_form():
     if logo_path.exists():
         st.image(str(logo_path), width=180)
 
-    st.title("Astons Invoice Platform")
+    st.title("Astons Invoice Hub")
     st.caption("Please sign in to continue.")
 
     if not db.has_any_users():

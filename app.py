@@ -69,10 +69,39 @@ st.set_page_config(
 
 ASTONS_DARK_GREEN = "#1a5c2e"
 ASTONS_MID_GREEN = "#3a8c4e"
+ASTONS_BORDER = "#e0e0e0"
 
 st.markdown(
     f"""
     <style>
+    /* Astons brand treatment — mirrors MyAstons and the client
+       onboarding app: white cards on a light-grey canvas, dark-green
+       primary actions, green top accent bar like the fee note header. */
+    .stApp::before {{
+        content: "";
+        position: fixed; top: 0; left: 0; right: 0; height: 5px;
+        background: {ASTONS_DARK_GREEN}; z-index: 999990;
+    }}
+    div[data-testid="stSidebar"] {{
+        border-right: 1px solid {ASTONS_BORDER};
+    }}
+    div[data-testid="stVerticalBlockBorderWrapper"] {{
+        background: #ffffff;
+        border: 1px solid {ASTONS_BORDER};
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }}
+    .stTabs [data-baseweb="tab-highlight"] {{
+        background-color: {ASTONS_DARK_GREEN};
+    }}
+    .stTabs [aria-selected="true"] {{
+        color: {ASTONS_DARK_GREEN};
+        font-weight: 600;
+    }}
+    div[data-testid="stExpander"] {{
+        background: #ffffff;
+        border-radius: 8px;
+    }}
     .stButton > button[kind="primary"] {{
         background-color: {ASTONS_DARK_GREEN};
         border-color: {ASTONS_DARK_GREEN};
@@ -82,6 +111,9 @@ st.markdown(
         border-color: {ASTONS_MID_GREEN};
     }}
     h1, h2, h3 {{
+        color: {ASTONS_DARK_GREEN};
+    }}
+    div[data-testid="stMetricValue"] {{
         color: {ASTONS_DARK_GREEN};
     }}
     .status-pending  {{ color: #b58900; font-weight: 600; }}
@@ -167,7 +199,7 @@ def sidebar_counts(user):
     with st.sidebar:
         if xero_client.is_connected():
             xc = db.xero_count_drafts()
-            st.subheader("Xero drafts")
+            st.subheader("Fee notes")
             st.metric("Awaiting review", xc.get("PENDING_REVIEW", 0))
             if user["role"] == "approver":
                 report = xero_watchdog.overdue_report()
@@ -486,7 +518,7 @@ def team_xero_drafts(user):
     """Team-member prep screen: raise in BrightManager, then here pick
     the entity and who raised it. Ash's approval queue arrives
     pre-filled — Ash just approves or rejects."""
-    st.subheader("Xero drafts")
+    st.subheader("Fee notes")
     show_flash("tq_flash")
     st.caption(
         "Raise your fee note in BrightManager as usual — it lands here "
@@ -618,15 +650,7 @@ def team_xero_drafts(user):
 
 def render_team_view(user):
     sidebar_counts(user)
-    tabs = st.tabs(["Xero drafts", "Legacy (uploads)"])
-    with tabs[0]:
-        team_xero_drafts(user)
-    with tabs[1]:
-        st.caption(
-            "The old upload workflow — kept for your past records. All "
-            "new fee notes go through BrightManager → Xero drafts."
-        )
-        team_my_invoices(user)
+    team_xero_drafts(user)
 
 
 # === APPROVER VIEWS ===
@@ -945,7 +969,7 @@ def show_flash(key: str):
 
 
 def approver_xero_queue(user):
-    st.subheader("Xero review queue")
+    st.subheader("Fee note approvals")
     show_flash("xq_flash")
     st.caption(
         "Fee-note drafts raised in BrightManager, pulled automatically from "
@@ -1744,10 +1768,20 @@ def approver_xero_settings(user):
                 db.xero_raiser_upsert(nr_initials, nr_name, nr_email)
                 st.rerun()
         for r in db.xero_raisers_all():
-            rcols = st.columns([2, 4, 4, 2])
+            rcols = st.columns([2, 3, 4, 3])
             rcols[0].write(f"**{r['initials']}**")
             rcols[1].write(r["name"] + ("" if r["active"] else "  _(inactive)_"))
-            rcols[2].caption(r["email"] or "no email")
+            with rcols[2]:
+                new_email = st.text_input(
+                    "Email", value=r["email"] or "",
+                    key=f"raiser_email_{r['initials']}",
+                    label_visibility="collapsed",
+                    placeholder="email for approve/reject notifications",
+                )
+                if new_email.strip() != (r["email"] or ""):
+                    if st.button("Save email", key=f"raiser_email_save_{r['initials']}"):
+                        db.xero_raiser_upsert(r["initials"], r["name"], new_email)
+                        st.rerun()
             label = "Deactivate" if r["active"] else "Reactivate"
             if rcols[3].button(label, key=f"raiser_toggle_{r['initials']}",
                                use_container_width=True):
@@ -1833,7 +1867,7 @@ def approver_xero_settings(user):
 def render_approver_view(user):
     sidebar_counts(user)
     tabs = st.tabs([
-        "Xero queue",
+        "Approvals",
         "Dashboard",
         "Exceptions",
         "Users",

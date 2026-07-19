@@ -291,12 +291,42 @@ def _ensure_drafts_columns(conn) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN initials TEXT")
 
 
+# One-off data seed (19 Jul 2026): raiser emails Ash supplied in chat,
+# applied where the registry row exists and has no email yet. Guarded by
+# a kv flag so it runs exactly once; harmless to leave in place.
+_RAISER_EMAIL_SEED = {
+    "ASC": "Ash@astonsaccountants.co.uk",
+    "BT": "Bradley@astonsaccountants.co.uk",
+    "CC": "Connor@astonsaccountants.co.uk",
+    "RD": "Ravi@astonsaccountants.co.uk",
+}
+
+
+def _seed_raiser_emails_once(conn) -> None:
+    flag = conn.execute(
+        "SELECT value FROM xero_kv WHERE key = 'raiser_email_seed_v1'"
+    ).fetchone()
+    if flag:
+        return
+    for initials, email in _RAISER_EMAIL_SEED.items():
+        conn.execute(
+            "UPDATE xero_raisers SET email = ? "
+            "WHERE initials = ? AND (email IS NULL OR email = '')",
+            (email, initials),
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO xero_kv (key, value) "
+        "VALUES ('raiser_email_seed_v1', 'done')"
+    )
+
+
 def init_db() -> None:
     """Create tables if they don't exist. Safe to call on every app boot."""
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         _migrate_xero_drafts_v2(conn)
         _ensure_drafts_columns(conn)
+        _seed_raiser_emails_once(conn)
 
     # Seed initial approver if DB has no users at all
     seed_initial_user_if_empty()

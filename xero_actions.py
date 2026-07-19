@@ -67,7 +67,8 @@ def preview_pdf(invoice_id: str, entity: str) -> dict:
     if not draft:
         raise ActionBlocked("Draft not found in the Hub database.")
     contact = fetch_contact(draft["tenant_id"], draft.get("contact_id"))
-    address = hub_addresses.resolve(draft.get("contact_name"), contact)
+    address = hub_addresses.resolve(draft.get("contact_name"), contact,
+                                    draft.get("contact_id"))
     return {
         "pdf": xero_pdf.render_draft_pdf(draft, contact, entity,
                                          address_lines=address["lines"]),
@@ -112,7 +113,8 @@ def approve_draft(invoice_id: str, user_id: int, entity: str,
     # 3. Render the branded PDF BEFORE any Xero write, with the best
     #    known client address (address book -> Xero -> BrightManager).
     import hub_addresses
-    address = hub_addresses.resolve(draft.get("contact_name"), contact)
+    address = hub_addresses.resolve(draft.get("contact_name"), contact,
+                                    contact_id)
     filename = f"FeeNote_{draft['invoice_number']}.pdf"
     pdf_bytes = xero_pdf.render_draft_pdf(draft, contact, entity,
                                           address_lines=address["lines"])

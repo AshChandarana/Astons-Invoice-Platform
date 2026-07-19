@@ -903,7 +903,8 @@ BM_TIDY_NOTE = (
 def client_address_widget(d, key_prefix):
     """Resolved client address for the fee note, with a manual override
     that is remembered per client."""
-    resolved = hub_addresses.resolve(d.get("contact_name"))
+    resolved = hub_addresses.resolve(d.get("contact_name"),
+                                     xero_contact_id=d.get("contact_id"))
     missing = not resolved["lines"]
     label = "Client address" + (" — ⚠️ MISSING" if missing else "")
     with st.expander(label, expanded=False):

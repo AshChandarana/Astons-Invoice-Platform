@@ -99,8 +99,11 @@ def draft_signals(draft: dict) -> dict:
     return {"tracking": sorted(tracking), "accounts": sorted(accounts)}
 
 
-def build_invoice_data(draft: dict, contact: dict, entity: str) -> dict:
-    """Assemble the data dict generate_branded_invoice expects."""
+def build_invoice_data(draft: dict, contact: dict, entity: str,
+                       address_lines: list = None) -> dict:
+    """Assemble the data dict generate_branded_invoice expects.
+    address_lines overrides the Xero contact address when provided (the
+    address book / BrightManager resolution in hub_addresses)."""
     try:
         line_items = json.loads(draft.get("line_items_json") or "[]")
     except json.JSONDecodeError:
@@ -114,7 +117,8 @@ def build_invoice_data(draft: dict, contact: dict, entity: str) -> dict:
         # same business rule as the upload workflow.
         "due_date": invoice_date,
         "client_name": draft.get("contact_name") or "",
-        "client_address": contact_address_lines(contact),
+        "client_address": (address_lines if address_lines is not None
+                           else contact_address_lines(contact)),
         "line_items": [
             {
                 "description": li.get("Description") or "(no description)",
@@ -133,7 +137,8 @@ def build_invoice_data(draft: dict, contact: dict, entity: str) -> dict:
     return data
 
 
-def render_draft_pdf(draft: dict, contact: dict, entity: str) -> bytes:
+def render_draft_pdf(draft: dict, contact: dict, entity: str,
+                     address_lines: list = None) -> bytes:
     """Render the branded fee note for a Xero draft and return the PDF
     bytes. Raises on any problem — nothing is written to Xero by this
     function, so a failure here aborts an approval cleanly."""
@@ -141,7 +146,7 @@ def render_draft_pdf(draft: dict, contact: dict, entity: str) -> bytes:
         raise ValueError(f"Unknown entity '{entity}' — must be AA or CW.")
     if not draft.get("invoice_number"):
         raise ValueError("Draft has no invoice number — cannot brand a fee note.")
-    data = build_invoice_data(draft, contact, entity)
+    data = build_invoice_data(draft, contact, entity, address_lines=address_lines)
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "feenote.pdf")
         generate_branded_invoice(data, out_path)

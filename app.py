@@ -38,6 +38,7 @@ import xero_recon
 import xero_reports
 import xero_watchdog
 import billing_import
+import hub_addresses
 
 UK_TZ = ZoneInfo("Europe/London")
 from generate_invoice import (
@@ -537,6 +538,7 @@ def team_xero_drafts(user):
                 if d.get("reference"):
                     st.caption(f"Reference: {d['reference']}")
 
+            client_address_widget(d, "tq")
             stored_raisers = [i for i in (d.get("raiser_pair") or "").split("/")
                               if i in known]
             default_raisers = (stored_raisers
@@ -602,8 +604,9 @@ def team_xero_drafts(user):
                     if a["hub_status"].startswith("APPROVED"):
                         st.success(f"Approved {format_timestamp(a['decided_at'])}")
                     else:
-                        st.error(f"Rejected: {a['reject_reason']} — amend and "
-                                 "re-raise in BrightManager.")
+                        st.error(f"Rejected: {a['reject_reason']} — delete the "
+                                 "old invoice in BrightManager, amend, and "
+                                 "re-raise.")
 
 
 def render_team_view(user):
@@ -884,6 +887,42 @@ def xero_entity_badge(draft) -> str:
 
 REJECT_REASONS = ["Wrong amount", "Wrong client", "Wrong narrative", "Duplicate", "Other"]
 
+BM_TIDY_NOTE = (
+    "Note: deleting the Xero draft does NOT remove it from BrightManager "
+    "— delete or amend the invoice in BM as well before re-raising."
+)
+
+
+def client_address_widget(d, key_prefix):
+    """Resolved client address for the fee note, with a manual override
+    that is remembered per client."""
+    resolved = hub_addresses.resolve(d.get("contact_name"))
+    missing = not resolved["lines"]
+    label = "Client address" + (" — ⚠️ MISSING" if missing else "")
+    with st.expander(label, expanded=False):
+        if missing:
+            st.warning(
+                "No address found in the Hub address book, the Xero "
+                "contact, or BrightManager. The fee note will print "
+                "without an address unless one is added here (saved once "
+                "per client, remembered for all future fee notes)."
+            )
+        else:
+            st.caption(f"Source: {resolved['source']}")
+        new_text = st.text_area(
+            "Address (one line per row)",
+            value="\n".join(resolved["lines"]),
+            key=f"{key_prefix}_addr_{d['invoice_id']}",
+        )
+        if st.button("Save address for this client",
+                     key=f"{key_prefix}_addrsave_{d['invoice_id']}"):
+            if not new_text.strip():
+                st.error("Enter the address first.")
+            else:
+                hub_addresses.save_manual(d["contact_name"], new_text)
+                st.rerun()
+    return resolved
+
 ENTITY_LABELS = {
     "AA": "AA — bank 60-83-71 / 19010489 (A-portfolio)",
     "CW": "CW — bank 04-13-76 / 00273335 (C-portfolio)",
@@ -1007,6 +1046,7 @@ def approver_xero_queue(user):
                         )
 
             # --- Actions ---
+            address = client_address_widget(d, "xq")
             # Defaults: team prep beats auto-detection beats blank.
             derived = d.get("entity") or xero_pdf.derive_entity(d, entity_map)
             stored_raisers = [i for i in (d.get("raiser_pair") or "").split("/")
@@ -1085,6 +1125,11 @@ def approver_xero_queue(user):
                              "invoice must be attributed (add missing initials "
                              "in Xero settings).")
                 else:
+                    if not address["lines"]:
+                        st.warning(
+                            "No client address on file — the fee note will "
+                            "print without one. Add it in the client address "
+                            "box above if needed.", icon="⚠️")
                     credit = xero_attrib.describe(raiser_choice)
                     st.warning(
                         f"This will set **{d['invoice_number']}** "
@@ -1161,10 +1206,11 @@ def approver_xero_queue(user):
                             st.session_state["xq_flash"] = (
                                 "success",
                                 f"{result['invoice_number']} deleted in Xero. "
-                                + (f"Raiser notified at {', '.join(notified)}."
+                                + (f"Raiser notified at {', '.join(notified)}. "
                                    if notified else
                                    "The raiser should amend and re-raise in "
-                                   "BrightManager (no raiser email on file to notify)."),
+                                   "BrightManager (no raiser email on file to notify). ")
+                                + BM_TIDY_NOTE,
                             )
                             st.session_state.pop(f"xq_confirm_rej_{iid}", None)
                             st.rerun()
@@ -1312,9 +1358,6 @@ def approver_xero_exceptions(user):
             )
 
 
-RAG_ICONS = {"green": "🟢", "amber": "🟠", "red": "🔴", None: "—"}
-
-
 def approver_dashboard(user):
     import pandas as pd
     import datetime as _dt
@@ -1350,27 +1393,17 @@ def approver_dashboard(user):
     # --- Firm view (SPEC 4.2) ---
     split = xero_reports.firm_split(entries)
     firm_target = db.billing_target_for("FIRM", start, targets)
-    firm_rag = xero_reports.rag_and_projection(split["total"], firm_target, year, month)
     mcols = st.columns(4)
-    mcols[0].metric(
-        "Firm net billed",
-        fmt_money(split["total"]),
-        delta=(f"{RAG_ICONS[firm_rag['rag']]} target {fmt_money(firm_target)}"
-               if firm_target else None),
+    mcols[0].metric("Firm net billed", fmt_money(split["total"]))
+    mcols[1].metric(
+        "Of firm target",
+        (f"{split['total'] / firm_target:.0%}" if firm_target else "—"),
+        delta=(f"target {fmt_money(firm_target)}" if firm_target else "no target set"),
         delta_color="off",
     )
-    mcols[1].metric("Projected month-end", fmt_money(firm_rag["projection"]),
-                    delta=(f"{firm_rag['pct_of_target']:.0%} of target"
-                           if firm_rag["pct_of_target"] else None),
-                    delta_color="off")
     mcols[2].metric("Fee notes", split["count"])
     mcols[3].metric("AA / CW",
                     f"{fmt_money(split['aa'])} / {fmt_money(split['cw'])}")
-    st.caption(
-        "Projection = net billed so far ÷ days elapsed × days in the "
-        "month (simple run-rate). Example: £1,000 by day 19 of a 31-day "
-        "month projects £1,631.58."
-    )
     if split["entity_untagged"]:
         st.caption(f"{fmt_money(split['entity_untagged'])} net not yet tagged AA/CW.")
 
@@ -1410,14 +1443,12 @@ def approver_dashboard(user):
         stats = people.get(person, {"net": 0.0, "sole_net": 0.0,
                                     "shared_net": 0.0, "count": 0})
         target = db.billing_target_for(person, start, targets)
-        rag = xero_reports.rag_and_projection(stats["net"], target, year, month)
         cols = st.columns([2, 2, 2, 2, 3])
-        cols[0].write(f"{RAG_ICONS[rag['rag']]} **{person}**")
+        cols[0].write(f"**{person}**")
         cols[1].write(fmt_money(stats["net"]))
         cols[1].caption(f"of {fmt_money(target)} target" if target else "no target set")
-        cols[2].write(fmt_money(rag["projection"]))
-        cols[2].caption(f"projected ({rag['pct_of_target']:.0%})"
-                        if rag["pct_of_target"] else "projected")
+        cols[2].write(f"{stats['net'] / target:.0%}" if target else "—")
+        cols[2].caption("of target")
         cols[3].caption(f"Sole {fmt_money(stats['sole_net'])}\n\n"
                         f"Shared {fmt_money(stats['shared_net'])}")
         with cols[4]:

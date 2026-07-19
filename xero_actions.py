@@ -60,14 +60,20 @@ def fetch_contact(tenant_id: str, contact_id: str) -> dict:
 def preview_pdf(invoice_id: str, entity: str) -> dict:
     """Render the branded fee note for a draft WITHOUT touching Xero's
     invoice state — used by the review screens so the PDF can be seen
-    before approval. Returns {'pdf': bytes, 'filename': str}."""
+    before approval. Returns {'pdf', 'filename', 'address_lines',
+    'address_source'} so the UI can flag a missing client address."""
+    import hub_addresses
     draft = db.xero_get_draft(invoice_id)
     if not draft:
         raise ActionBlocked("Draft not found in the Hub database.")
     contact = fetch_contact(draft["tenant_id"], draft.get("contact_id"))
+    address = hub_addresses.resolve(draft.get("contact_name"), contact)
     return {
-        "pdf": xero_pdf.render_draft_pdf(draft, contact, entity),
+        "pdf": xero_pdf.render_draft_pdf(draft, contact, entity,
+                                         address_lines=address["lines"]),
         "filename": f"FeeNote_{draft['invoice_number'] or 'draft'}.pdf",
+        "address_lines": address["lines"],
+        "address_source": address["source"],
     }
 
 
@@ -103,9 +109,13 @@ def approve_draft(invoice_id: str, user_id: int, entity: str,
     contact_id = draft.get("contact_id") or (live.get("Contact") or {}).get("ContactID")
     contact = fetch_contact(tenant_id, contact_id)
 
-    # 3. Render the branded PDF BEFORE any Xero write.
+    # 3. Render the branded PDF BEFORE any Xero write, with the best
+    #    known client address (address book -> Xero -> BrightManager).
+    import hub_addresses
+    address = hub_addresses.resolve(draft.get("contact_name"), contact)
     filename = f"FeeNote_{draft['invoice_number']}.pdf"
-    pdf_bytes = xero_pdf.render_draft_pdf(draft, contact, entity)
+    pdf_bytes = xero_pdf.render_draft_pdf(draft, contact, entity,
+                                          address_lines=address["lines"])
 
     # 4. Point of no return: DRAFT -> AUTHORISED.
     xero_client.api_post(
@@ -196,8 +206,9 @@ def reject_draft(invoice_id: str, user_id: int, reason: str) -> dict:
             f"({'£' + format(draft['total'] or 0, ',.2f')}) was rejected in the "
             f"Invoice Hub.</p>"
             f"<p><b>Reason:</b> {html_mod.escape(reason.strip())}</p>"
-            f"<p>The draft has been deleted in Xero — please amend and "
-            f"re-raise it in BrightManager.</p>"
+            f"<p>The draft has been deleted in Xero. <b>BrightManager still "
+            f"holds the old invoice</b> — delete or amend it in BM, then "
+            f"re-raise.</p>"
         )
         if xero_watchdog.send_email(
             f"Fee note {draft['invoice_number']} rejected — please re-raise",

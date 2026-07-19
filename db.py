@@ -191,6 +191,17 @@ CREATE TABLE IF NOT EXISTS xero_split_overrides (
     first_share REAL NOT NULL CHECK(first_share > 0 AND first_share < 1)
 );
 
+-- Client address book: addresses for the branded fee note, keyed on
+-- normalised client name. Filled automatically from Xero contacts or
+-- the BrightManager API, or manually by the team — BM pushes invoices
+-- to Xero without contact addresses, so this is the reliable source.
+CREATE TABLE IF NOT EXISTS client_addresses (
+    client_key   TEXT PRIMARY KEY,
+    address_json TEXT NOT NULL,
+    source       TEXT NOT NULL CHECK(source IN ('xero', 'bm', 'manual')),
+    updated_at   TEXT NOT NULL
+);
+
 -- Monthly billing targets (SPEC 4.1): per raiser initials or 'FIRM',
 -- with effective-from dates so history is preserved.
 CREATE TABLE IF NOT EXISTS billing_targets (
@@ -985,6 +996,33 @@ def xero_split_override_set(pair: str, first_share) -> None:
                 """,
                 (pair.strip().upper(), float(first_share)),
             )
+
+
+# === CLIENT ADDRESS BOOK ===
+
+def client_address_get(client_key: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM client_addresses WHERE client_key = ?", (client_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def client_address_set(client_key: str, address_lines: list, source: str) -> None:
+    import json as _json
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO client_addresses (client_key, address_json, source, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(client_key) DO UPDATE SET
+                address_json = excluded.address_json,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            (client_key, _json.dumps(address_lines), source, now),
+        )
 
 
 # === BILLING: TARGETS & IMPORTS (SPEC 4 / 6.2) ===

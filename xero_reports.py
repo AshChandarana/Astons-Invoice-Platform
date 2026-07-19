@@ -91,32 +91,6 @@ def per_person(entries: list) -> dict:
     return people
 
 
-def rag_and_projection(billed: float, target, year: int, month: int,
-                       today: dt.date = None) -> dict:
-    """RAG per SPEC 4.1: green >= on-pace, amber within 15% of pace,
-    red behind. Projection: 'at current pace, finishes month at £X'."""
-    days_in_month = calendar.monthrange(year, month)[1]
-    today = today or dt.date.today()
-    if (today.year, today.month) == (year, month):
-        day = today.day
-    elif dt.date(year, month, 1) < today:
-        day = days_in_month  # past month — complete
-    else:
-        day = 1              # future month
-    projection = billed / day * days_in_month
-    result = {"projection": projection, "rag": None, "pct_of_target": None}
-    if target:
-        expected = target * day / days_in_month
-        result["pct_of_target"] = projection / target
-        if billed >= expected:
-            result["rag"] = "green"
-        elif billed >= expected * 0.85:
-            result["rag"] = "amber"
-        else:
-            result["rag"] = "red"
-    return result
-
-
 def firm_split(entries: list) -> dict:
     aa = sum(e["net"] for e in entries if e["entity"] == "AA")
     cw = sum(e["net"] for e in entries if e["entity"] == "CW")

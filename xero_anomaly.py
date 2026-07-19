@@ -8,14 +8,14 @@ seconds.
 
 Flags:
   duplicate    RED    same client + same net within 30 days
-  fee_changed  AMBER  monthly client's net differs from their previous
-                      monthly fee note (delta shown)
-  below_prior  AMBER  non-monthly fee lower than the comparable fee
-                      ~12 months prior (both figures shown)
+  below_prior  AMBER  fee lower than the comparable fee ~12 months
+                      prior (both figures shown)
   first_bill   INFO   no history for this client
 
-'Round-number drift' (vs BM's recorded recurring fee) needs BM data and
-waits for Phase 7.1's BM access.
+The monthly/non-monthly distinction was dropped at Ash's request (all
+fee notes are ad hoc), which also removes the spec's monthly
+'fee changed' rule. 'Round-number drift' (vs BM's recorded recurring
+fee) needs BM data and waits for Phase 7.1's BM access.
 """
 
 import datetime as dt
@@ -78,44 +78,25 @@ def flags_for_draft(draft: dict, history: list) -> list:
             })
             break
 
-    # Fee changed: vs client's previous monthly fee note (SPEC: amber)
-    monthly_history = sorted(
-        (e for e in mine if e.get("monthly")),
-        key=lambda e: e.get("date") or "", reverse=True,
-    )
-    if monthly_history:
-        prev = monthly_history[0]
-        prev_net = round(float(prev["net"]), 2)
-        if abs(prev_net - net) > 0.01:
-            delta = net - prev_net
+    # Below prior year: vs comparable fee ~12 months ago
+    prior_year = []
+    for e in mine:
+        try:
+            months_back = (draft_date - dt.date.fromisoformat(e["date"])).days / 30.4
+        except (ValueError, TypeError):
+            continue
+        if 10 <= months_back <= 14:
+            prior_year.append(e)
+    if prior_year:
+        comparable = max(prior_year, key=lambda e: e.get("date") or "")
+        prior_net = round(float(comparable["net"]), 2)
+        if net < prior_net - 0.01:
             flags.append({
-                "level": "amber", "label": "Fee changed",
-                "detail": (f"Previous monthly fee was £{prev_net:,.2f} "
-                           f"({prev['fee_note_no']}, {prev['date']}) — "
-                           f"this is {'+' if delta > 0 else ''}£{delta:,.2f}."),
+                "level": "amber", "label": "Below prior year",
+                "detail": (f"£{net:,.2f} vs £{prior_net:,.2f} "
+                           f"({comparable['fee_note_no']}, "
+                           f"{comparable['date']}) a year ago."),
             })
-
-    # Below prior year: non-monthly vs comparable ~12 months ago
-    if not monthly_history:
-        window = [e for e in mine if not e.get("monthly")]
-        prior_year = []
-        for e in window:
-            try:
-                months_back = (draft_date - dt.date.fromisoformat(e["date"])).days / 30.4
-            except (ValueError, TypeError):
-                continue
-            if 10 <= months_back <= 14:
-                prior_year.append(e)
-        if prior_year:
-            comparable = max(prior_year, key=lambda e: e.get("date") or "")
-            prior_net = round(float(comparable["net"]), 2)
-            if net < prior_net - 0.01:
-                flags.append({
-                    "level": "amber", "label": "Below prior year",
-                    "detail": (f"£{net:,.2f} vs £{prior_net:,.2f} "
-                               f"({comparable['fee_note_no']}, "
-                               f"{comparable['date']}) a year ago."),
-                })
 
     return flags
 

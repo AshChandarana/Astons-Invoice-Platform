@@ -163,33 +163,27 @@ def fmt_money(value) -> str:
 
 
 def sidebar_counts(user):
-    counts = db.count_by_status()
-    pending = counts.get("pending_approval", 0)
-    approved = counts.get("approved", 0)
-    sent = counts.get("sent", 0)
-    rejected = counts.get("rejected", 0)
-
     with st.sidebar:
-        st.subheader("Status")
-        st.metric("Pending approval", pending)
-        st.metric("Approved (ready to send)", approved)
-        st.metric("Sent", sent)
-        st.metric("Rejected", rejected)
-        if user["role"] == "approver" and xero_client.is_connected():
+        if xero_client.is_connected():
             xc = db.xero_count_drafts()
+            st.subheader("Xero drafts")
+            st.metric("Awaiting review", xc.get("PENDING_REVIEW", 0))
+            if user["role"] == "approver":
+                report = xero_watchdog.overdue_report()
+                overdue = len(report["warn"]) + len(report["escalate"])
+                if overdue:
+                    st.metric("Waiting 3+ days", overdue,
+                              delta=f"{len(report['escalate'])} escalated"
+                              if report["escalate"] else None,
+                              delta_color="inverse")
+                exceptions = (xc.get("EXTERNAL_ACTION", 0)
+                              + xc.get("APPROVED_NO_ATTACHMENT", 0))
+                if exceptions:
+                    st.metric("Exceptions", exceptions)
+        legacy_pending = db.count_by_status().get("pending_approval", 0)
+        if legacy_pending:
             st.divider()
-            st.subheader("Xero")
-            st.metric("Drafts awaiting review", xc.get("PENDING_REVIEW", 0))
-            report = xero_watchdog.overdue_report()
-            overdue = len(report["warn"]) + len(report["escalate"])
-            if overdue:
-                st.metric("Waiting 3+ days", overdue,
-                          delta=f"{len(report['escalate'])} escalated" if report["escalate"] else None,
-                          delta_color="inverse")
-            exceptions = (xc.get("EXTERNAL_ACTION", 0)
-                          + xc.get("APPROVED_NO_ATTACHMENT", 0))
-            if exceptions:
-                st.metric("Exceptions", exceptions)
+            st.caption(f"Legacy uploads pending: {legacy_pending}")
         st.divider()
         st.caption(
             "All data on this platform stays inside Astons. "
@@ -487,12 +481,141 @@ def team_my_invoices(user):
                 st.warning(f"**Rejection note:** {inv['rejection_note']}")
 
 
+def team_xero_drafts(user):
+    """Team-member prep screen: raise in BrightManager, then here pick
+    the entity and who raised it. Ash's approval queue arrives
+    pre-filled — Ash just approves or rejects."""
+    st.subheader("Xero drafts")
+    show_flash("tq_flash")
+    st.caption(
+        "Raise your fee note in BrightManager as usual — it lands here "
+        "automatically. Pick the entity and who raised it, preview the "
+        "branded fee note, and it goes to Ash for approval."
+    )
+    if not xero_client.is_connected():
+        st.info("Xero isn't connected yet — Ash needs to set this up.")
+        return
+
+    with st.spinner("Checking Xero for new drafts..."):
+        xero_sync.maybe_sync()
+
+    raisers_reg = db.xero_raisers_all(active_only=True)
+    raiser_names = {r["initials"]: r["name"] for r in raisers_reg}
+    known = set(raiser_names)
+    my_initials = (user.get("initials") or "").strip().upper()
+    if my_initials and my_initials not in known:
+        my_initials = ""
+    if not my_initials:
+        st.warning(
+            "Your account has no raiser initials yet — ask Ash to set "
+            "them in the Users tab so 'raised by' can default to you."
+        )
+
+    drafts = db.xero_list_drafts("PENDING_REVIEW")
+    if not drafts:
+        st.success("No drafts waiting — raise one in BrightManager and "
+                   "it will appear here within a few minutes.")
+    for d in drafts:
+        iid = d["invoice_id"]
+        prepped = bool(d.get("entity") and d.get("raiser_pair"))
+        with st.container(border=True):
+            top = st.columns([3, 2, 2, 3])
+            with top[0]:
+                st.write(f"**{d['contact_name'] or '(no contact)'}**")
+                st.caption(f"{d['invoice_number'] or '(no number)'}  |  "
+                           f"{format_date(d['date'])}")
+            with top[1]:
+                st.write(fmt_money(d["total"]))
+                st.caption(f"Net {fmt_money(d['sub_total'])}")
+            with top[2]:
+                if prepped:
+                    st.success("Ready for Ash", icon="✅")
+                    st.caption(f"{d['entity']} · {d['raiser_pair']}")
+                else:
+                    st.warning("Needs prep", icon="📝")
+            with top[3]:
+                if d.get("reference"):
+                    st.caption(f"Reference: {d['reference']}")
+
+            stored_raisers = [i for i in (d.get("raiser_pair") or "").split("/")
+                              if i in known]
+            default_raisers = (stored_raisers
+                               or xero_attrib.parse_reference(d.get("reference"), known)
+                               or ([my_initials] if my_initials else []))
+            pcols = st.columns([3, 3, 2, 2])
+            entity_choice = pcols[0].selectbox(
+                "Entity", ["AA", "CW"],
+                index=["AA", "CW"].index(d["entity"]) if d.get("entity") else None,
+                format_func=lambda e: ENTITY_LABELS[e],
+                placeholder="Select AA or CW...",
+                key=f"tq_entity_{iid}",
+            )
+            raiser_choice = pcols[1].multiselect(
+                "Raised by", options=sorted(known), default=default_raisers,
+                max_selections=2,
+                format_func=lambda i: f"{i} — {raiser_names[i]}",
+                placeholder="Pick 1 or 2...",
+                key=f"tq_raisers_{iid}",
+            )
+            with pcols[2]:
+                st.write("")
+                if entity_choice and st.button("Preview PDF", key=f"tq_prev_{iid}",
+                                               use_container_width=True):
+                    try:
+                        with st.spinner("Generating preview..."):
+                            st.session_state[f"tq_pdf_{iid}"] = (
+                                xero_actions.preview_pdf(iid, entity_choice))
+                    except Exception as exc:
+                        st.error(f"Preview failed: {exc}")
+                preview = st.session_state.get(f"tq_pdf_{iid}")
+                if preview:
+                    st.download_button(
+                        "Download preview", data=preview["pdf"],
+                        file_name=preview["filename"], mime="application/pdf",
+                        key=f"tq_prevdl_{iid}", use_container_width=True,
+                    )
+            with pcols[3]:
+                st.write("")
+                if st.button("Save for approval", key=f"tq_save_{iid}",
+                             type="primary", use_container_width=True):
+                    if not entity_choice or not raiser_choice:
+                        st.error("Pick the entity and at least one raiser first.")
+                    else:
+                        db.xero_set_draft_prep(
+                            iid, entity_choice, "/".join(raiser_choice), user["id"])
+                        st.session_state["tq_flash"] = (
+                            "success",
+                            f"{d['invoice_number']} is ready for Ash's approval.")
+                        st.rerun()
+
+    actioned = db.xero_recent_actioned()
+    if actioned:
+        st.divider()
+        st.write("**Recently actioned by Ash**")
+        for a in actioned[:30]:
+            with st.container(border=True):
+                cols = st.columns([3, 2, 4])
+                cols[0].write(f"**{a['contact_name']}**")
+                cols[0].caption(a["invoice_number"] or "")
+                cols[1].write(fmt_money(a["total"]))
+                with cols[2]:
+                    if a["hub_status"].startswith("APPROVED"):
+                        st.success(f"Approved {format_timestamp(a['decided_at'])}")
+                    else:
+                        st.error(f"Rejected: {a['reject_reason']} — amend and "
+                                 "re-raise in BrightManager.")
+
+
 def render_team_view(user):
     sidebar_counts(user)
-    tabs = st.tabs(["New submission", "My invoices"])
+    tabs = st.tabs(["Xero drafts", "Legacy (uploads)"])
     with tabs[0]:
-        team_new_submission(user)
+        team_xero_drafts(user)
     with tabs[1]:
+        st.caption(
+            "The old upload workflow — kept for your past records. All "
+            "new fee notes go through BrightManager → Xero drafts."
+        )
         team_my_invoices(user)
 
 
@@ -629,21 +752,25 @@ def approver_users(user):
         with st.form("new_user_form", clear_on_submit=True):
             nu_username = st.text_input("Username (lowercase, no spaces)")
             nu_full_name = st.text_input("Full name")
+            nu_initials = st.text_input("Raiser initials (2-3 letters, e.g. BT)",
+                                        max_chars=3)
             nu_password = st.text_input("Temporary password", type="password")
             nu_role = st.selectbox("Role", options=["team_member", "approver"])
             submitted = st.form_submit_button("Create user", type="primary")
         if submitted:
             if not nu_username or not nu_password or not nu_full_name:
-                st.error("All fields are required.")
+                st.error("Username, full name and password are required.")
             elif db.get_user_by_username(nu_username):
                 st.error(f"A user with username '{nu_username}' already exists.")
             else:
-                db.create_user(
+                new_id = db.create_user(
                     username=nu_username,
                     password=nu_password,
                     full_name=nu_full_name,
                     role=nu_role,
                 )
+                if nu_initials.strip():
+                    db.set_user_initials(new_id, nu_initials)
                 st.success(f"Created user '{nu_username}'.")
                 st.rerun()
 
@@ -656,6 +783,15 @@ def approver_users(user):
             with cols[0]:
                 st.write(f"**{u['full_name']}**")
                 st.caption(f"@{u['username']}")
+                new_initials = st.text_input(
+                    "Raiser initials", value=u.get("initials") or "",
+                    max_chars=3, key=f"user_init_{u['id']}",
+                    label_visibility="collapsed", placeholder="initials",
+                )
+                if (new_initials or "").strip().upper() != (u.get("initials") or ""):
+                    if st.button("Save initials", key=f"user_init_save_{u['id']}"):
+                        db.set_user_initials(u["id"], new_initials)
+                        st.rerun()
             with cols[1]:
                 st.caption(u["role"])
             with cols[2]:
@@ -871,8 +1007,12 @@ def approver_xero_queue(user):
                         )
 
             # --- Actions ---
-            derived = xero_pdf.derive_entity(d, entity_map)
-            parsed_raisers = xero_attrib.parse_reference(d.get("reference"), known)
+            # Defaults: team prep beats auto-detection beats blank.
+            derived = d.get("entity") or xero_pdf.derive_entity(d, entity_map)
+            stored_raisers = [i for i in (d.get("raiser_pair") or "").split("/")
+                              if i in known]
+            parsed_raisers = stored_raisers or xero_attrib.parse_reference(
+                d.get("reference"), known)
             action_cols = st.columns([3, 3, 2, 2])
             with action_cols[0]:
                 options = ["AA", "CW"]
@@ -884,8 +1024,29 @@ def approver_xero_queue(user):
                     placeholder="Select AA or CW...",
                     key=f"xq_entity_{iid}",
                 )
-                if derived:
+                if d.get("entity"):
+                    st.caption("Set by the team at prep.")
+                elif derived:
                     st.caption(f"Auto-detected {derived} from tracking/nominals.")
+                if entity_choice:
+                    if st.button("Preview fee note", key=f"xq_prev_{iid}",
+                                 use_container_width=True):
+                        try:
+                            with st.spinner("Generating preview..."):
+                                st.session_state[f"xq_pdf_{iid}"] = (
+                                    xero_actions.preview_pdf(iid, entity_choice))
+                        except Exception as exc:
+                            st.error(f"Preview failed: {exc}")
+                    preview = st.session_state.get(f"xq_pdf_{iid}")
+                    if preview:
+                        st.download_button(
+                            "Download preview PDF",
+                            data=preview["pdf"],
+                            file_name=preview["filename"],
+                            mime="application/pdf",
+                            key=f"xq_prevdl_{iid}",
+                            use_container_width=True,
+                        )
             with action_cols[1]:
                 raiser_choice = st.multiselect(
                     "Raised by (required)",
@@ -896,16 +1057,15 @@ def approver_xero_queue(user):
                     placeholder="Pick 1 or 2 raisers...",
                     key=f"xq_raisers_{iid}",
                 )
-                if parsed_raisers:
+                if stored_raisers:
+                    st.caption("Set by the team at prep.")
+                elif parsed_raisers:
                     st.caption(f"From reference: {'/'.join(parsed_raisers)}")
                 else:
                     hint = xero_attrib.unregistered_pair_hint(d.get("reference"), known)
                     if hint:
                         st.caption(f"Reference contains '{hint}' — add these "
                                    "initials in Xero settings to auto-attribute.")
-                monthly_choice = st.checkbox(
-                    "Monthly client", key=f"xq_monthly_{iid}",
-                )
             with action_cols[2]:
                 if st.button("Approve", key=f"xq_app_{iid}", type="primary",
                              use_container_width=True):
@@ -943,7 +1103,6 @@ def approver_xero_queue(user):
                                 result = xero_actions.approve_draft(
                                     iid, user["id"], entity_choice,
                                     raisers=raiser_choice,
-                                    monthly=monthly_choice,
                                 )
                             if flags:
                                 # SPEC 7.2: flag events logged so caught
@@ -1031,13 +1190,8 @@ def approver_xero_queue(user):
                     st.write(fmt_money(a["total"]))
                     st.caption(a["entity"] or "")
                     full_row = db.xero_get_draft(a["invoice_id"]) or {}
-                    bits = []
                     if full_row.get("raiser_pair"):
-                        bits.append(f"Raised by {full_row['raiser_pair']}")
-                    if full_row.get("monthly") is not None:
-                        bits.append("Monthly" if full_row["monthly"] else "Non-monthly")
-                    if bits:
-                        st.caption(" · ".join(bits))
+                        st.caption(f"Raised by {full_row['raiser_pair']}")
                 with cols2[2]:
                     if a["hub_status"] == "APPROVED":
                         st.success("Approved", icon="✅")
@@ -1209,10 +1363,14 @@ def approver_dashboard(user):
                     delta=(f"{firm_rag['pct_of_target']:.0%} of target"
                            if firm_rag["pct_of_target"] else None),
                     delta_color="off")
-    mcols[2].metric("Monthly / Non-monthly",
-                    f"{fmt_money(split['monthly'])} / {fmt_money(split['non_monthly'])}")
+    mcols[2].metric("Fee notes", split["count"])
     mcols[3].metric("AA / CW",
                     f"{fmt_money(split['aa'])} / {fmt_money(split['cw'])}")
+    st.caption(
+        "Projection = net billed so far ÷ days elapsed × days in the "
+        "month (simple run-rate). Example: £1,000 by day 19 of a 31-day "
+        "month projects £1,631.58."
+    )
     if split["entity_untagged"]:
         st.caption(f"{fmt_money(split['entity_untagged'])} net not yet tagged AA/CW.")
 
@@ -1636,13 +1794,10 @@ def render_approver_view(user):
         "Xero queue",
         "Dashboard",
         "Exceptions",
-        "Pending approvals",
-        "Approved",
-        "Sent",
-        "Rejected",
         "Users",
         "Audit",
         "Xero settings",
+        "Legacy",
     ])
     with tabs[0]:
         approver_xero_queue(user)
@@ -1651,19 +1806,29 @@ def render_approver_view(user):
     with tabs[2]:
         approver_xero_exceptions(user)
     with tabs[3]:
-        approver_queue(user)
-    with tabs[4]:
-        approver_archive(user, "approved", "Approved (awaiting send)", "No approved invoices waiting.")
-    with tabs[5]:
-        approver_archive(user, "sent", "Sent", "No sent invoices yet.")
-    with tabs[6]:
-        approver_archive(user, "rejected", "Rejected", "No rejected invoices.")
-    with tabs[7]:
         approver_users(user)
-    with tabs[8]:
+    with tabs[4]:
         approver_audit(user)
-    with tabs[9]:
+    with tabs[5]:
         approver_xero_settings(user)
+    with tabs[6]:
+        st.caption(
+            "The old upload workflow, kept for past records. All new fee "
+            "notes flow BrightManager → Xero → the Xero queue."
+        )
+        legacy_pending = db.count_by_status().get("pending_approval", 0)
+        if legacy_pending:
+            st.warning(f"{legacy_pending} old upload(s) still pending — "
+                       "approve/reject them here or ask the team to "
+                       "re-raise in BrightManager.")
+        with st.expander("Pending approvals", expanded=bool(legacy_pending)):
+            approver_queue(user)
+        with st.expander("Approved (awaiting send)"):
+            approver_archive(user, "approved", "Approved (awaiting send)", "No approved invoices waiting.")
+        with st.expander("Sent"):
+            approver_archive(user, "sent", "Sent", "No sent invoices yet.")
+        with st.expander("Rejected"):
+            approver_archive(user, "rejected", "Rejected", "No rejected invoices.")
 
 
 # === MAIN ===

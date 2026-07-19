@@ -118,13 +118,10 @@ def rag_and_projection(billed: float, target, year: int, month: int,
 
 
 def firm_split(entries: list) -> dict:
-    monthly = sum(e["net"] for e in entries if e["monthly"])
-    non_monthly = sum(e["net"] for e in entries if not e["monthly"])
     aa = sum(e["net"] for e in entries if e["entity"] == "AA")
     cw = sum(e["net"] for e in entries if e["entity"] == "CW")
     untagged = sum(e["net"] for e in entries if e["entity"] not in ("AA", "CW"))
     return {"total": sum(e["net"] for e in entries),
-            "monthly": monthly, "non_monthly": non_monthly,
             "aa": aa, "cw": cw, "entity_untagged": untagged,
             "count": len(entries)}
 
@@ -200,7 +197,6 @@ def register_rows(entries: list) -> list:
         "Gross": round(e["gross"], 2) if e["gross"] is not None else None,
         "Issued by": "/".join(s["initials"] for s in e["splits"]),
         "Issued on": e["date"],
-        "Monthly": "Y" if e["monthly"] else ("N" if e["monthly"] is not None else ""),
         "Xero status": e["xero_status"],
         "Source": e["source"],
     } for e in entries]

@@ -270,9 +270,14 @@ def _ensure_drafts_columns(conn) -> None:
         ("split_json", "TEXT"),
         ("monthly", "INTEGER"),
         ("client_code", "TEXT"),
+        ("prepped_by_user_id", "INTEGER"),
     ]:
         if name not in cols:
             conn.execute(f"ALTER TABLE xero_drafts ADD COLUMN {name} {ddl}")
+
+    user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if "initials" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN initials TEXT")
 
 
 def init_db() -> None:
@@ -361,7 +366,7 @@ def get_user_by_username(username: str):
 def list_users():
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, username, full_name, role, active, created_at FROM users ORDER BY created_at DESC"
+            "SELECT id, username, full_name, initials, role, active, created_at FROM users ORDER BY created_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -756,6 +761,45 @@ def xero_dismiss_draft(invoice_id: str, user_id: int) -> None:
         )
         _write_audit(conn, user_id, None, "xero_dismiss_exception",
                      f"xero_invoice_id={invoice_id}")
+
+
+def set_user_initials(user_id: int, initials) -> None:
+    """Set a user's raiser initials and mirror them into the raiser
+    registry so attribution and reporting stay in sync."""
+    initials = (initials or "").strip().upper() or None
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET initials = ? WHERE id = ?",
+                     (initials, user_id))
+        if initials:
+            row = conn.execute("SELECT full_name FROM users WHERE id = ?",
+                               (user_id,)).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    INSERT INTO xero_raisers (initials, name, active)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(initials) DO UPDATE SET name = excluded.name,
+                                                        active = 1
+                    """,
+                    (initials, row["full_name"]),
+                )
+
+
+def xero_set_draft_prep(invoice_id: str, entity, raiser_pair, user_id: int) -> None:
+    """Team-member prep: record entity + raiser(s) on a pending draft so
+    it arrives in the approval queue ready to action."""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE xero_drafts
+            SET entity = ?, raiser_pair = ?, prepped_by_user_id = ?
+            WHERE invoice_id = ? AND hub_status = 'PENDING_REVIEW'
+            """,
+            (entity, raiser_pair, user_id, invoice_id),
+        )
+        _write_audit(conn, user_id, None, "xero_prep",
+                     f"xero_invoice_id={invoice_id} entity={entity} "
+                     f"raisers={raiser_pair}")
 
 
 def xero_get_draft(invoice_id: str):

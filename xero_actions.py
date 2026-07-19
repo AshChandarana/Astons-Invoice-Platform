@@ -46,8 +46,33 @@ def _require_still_draft(live: dict, invoice_id: str) -> None:
         )
 
 
+def fetch_contact(tenant_id: str, contact_id: str) -> dict:
+    if not contact_id:
+        return {}
+    try:
+        cdata = xero_client.api_get(tenant_id, f"Contacts/{contact_id}")
+        contacts = (cdata or {}).get("Contacts", [])
+        return contacts[0] if contacts else {}
+    except xero_client.XeroApiError:
+        return {}
+
+
+def preview_pdf(invoice_id: str, entity: str) -> dict:
+    """Render the branded fee note for a draft WITHOUT touching Xero's
+    invoice state — used by the review screens so the PDF can be seen
+    before approval. Returns {'pdf': bytes, 'filename': str}."""
+    draft = db.xero_get_draft(invoice_id)
+    if not draft:
+        raise ActionBlocked("Draft not found in the Hub database.")
+    contact = fetch_contact(draft["tenant_id"], draft.get("contact_id"))
+    return {
+        "pdf": xero_pdf.render_draft_pdf(draft, contact, entity),
+        "filename": f"FeeNote_{draft['invoice_number'] or 'draft'}.pdf",
+    }
+
+
 def approve_draft(invoice_id: str, user_id: int, entity: str,
-                  raisers: list = None, monthly: bool = False) -> dict:
+                  raisers: list = None, monthly: bool = None) -> dict:
     """Approve: AUTHORISED in Xero + branded PDF attached with
     IncludeOnline. Raiser attribution is mandatory (SPEC section 3).
     Returns {'attachment_ok': bool, 'error': str|None}."""
@@ -74,15 +99,9 @@ def approve_draft(invoice_id: str, user_id: int, entity: str,
     draft = db.xero_get_draft(invoice_id)
 
     # 2. Contact address for the fee note (accounting.contacts.read).
-    contact = {}
+    #    Address is nice-to-have; the name is already on the draft.
     contact_id = draft.get("contact_id") or (live.get("Contact") or {}).get("ContactID")
-    if contact_id:
-        try:
-            cdata = xero_client.api_get(tenant_id, f"Contacts/{contact_id}")
-            contacts = (cdata or {}).get("Contacts", [])
-            contact = contacts[0] if contacts else {}
-        except xero_client.XeroApiError:
-            contact = {}  # address is nice-to-have; name is on the draft
+    contact = fetch_contact(tenant_id, contact_id)
 
     # 3. Render the branded PDF BEFORE any Xero write.
     filename = f"FeeNote_{draft['invoice_number']}.pdf"

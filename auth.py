@@ -28,7 +28,8 @@ def _login_form():
     """Render the login form. Does NOT stop the page — caller is responsible."""
     logo_path = Path(__file__).parent / "astons_logo.png"
     if logo_path.exists():
-        st.image(str(logo_path), width=180)
+        # 200px = exact quarter of the 800px source, so it stays crisp
+        st.image(str(logo_path), width=200)
 
     st.title("Astons Invoice Hub")
     st.caption("Please sign in to continue.")

@@ -103,6 +103,25 @@ def send_email(subject: str, html_body: str, to: list = None) -> bool:
         return False
 
 
+def notify_prepped(draft: dict, prepped_by: str) -> bool:
+    """Email the approver when a team member sends a fee note for
+    approval — the moment it actually needs Ash's attention."""
+    import html
+    total = f"£{float(draft.get('total') or 0):,.2f}"
+    body = (
+        f"<p><b>{html.escape(prepped_by)}</b> has prepared fee note "
+        f"<b>{html.escape(draft.get('invoice_number') or '(no number)')}</b> "
+        f"for <b>{html.escape(draft.get('contact_name') or '')}</b> "
+        f"({total}) — it is ready for your approval.</p>"
+        f"<p><a href='{_hub_url()}'>Open the approvals queue</a></p>"
+    )
+    return send_email(
+        f"Fee note {draft.get('invoice_number') or ''} ready for approval "
+        f"({html.escape(draft.get('contact_name') or '')})",
+        body,
+    )
+
+
 # === SWEEP ===
 
 def draft_age_days(draft: dict) -> int:

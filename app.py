@@ -66,6 +66,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Crisp logo in the app chrome's top-left, same placement as MyAstons
+# and the client onboarding app (the 800px source renders sharply here,
+# unlike the scaled st.image header it replaces).
+st.logo("astons_logo.png", size="large")
+
 
 ASTONS_DARK_GREEN = "#1a5c2e"
 ASTONS_MID_GREEN = "#3a8c4e"
@@ -130,6 +135,41 @@ st.markdown(
 db.init_db()
 
 
+@st.cache_resource
+def start_background_worker():
+    """Always-on worker inside the app container: syncs Xero, runs the
+    watchdog and takes the nightly backup even when nobody has the Hub
+    open in a browser. Each part throttles itself in the DB, so the
+    5-minute tick is cheap. cache_resource guarantees one thread per
+    container regardless of how many sessions run app.py."""
+    import threading
+    import time as _time
+    import xero_backup
+
+    def loop():
+        while True:
+            try:
+                xero_sync.maybe_sync()
+            except Exception:
+                pass  # sync logs its own failures
+            try:
+                xero_watchdog.maybe_run()
+            except Exception:
+                pass
+            try:
+                xero_backup.maybe_backup()
+            except Exception:
+                pass
+            _time.sleep(300)
+
+    thread = threading.Thread(target=loop, daemon=True, name="hub-worker")
+    thread.start()
+    return thread
+
+
+start_background_worker()
+
+
 # === HELPERS ===
 
 def format_status(status: str) -> str:
@@ -165,15 +205,11 @@ def format_date(iso: str) -> str:
 
 
 def header(user):
-    logo_path = Path(__file__).parent / "astons_logo.png"
-    cols = st.columns([1, 4, 2])
+    cols = st.columns([5, 2])
     with cols[0]:
-        if logo_path.exists():
-            st.image(str(logo_path), width=120)
-    with cols[1]:
         st.title("Invoice Hub")
-        st.caption("Generate branded Astons invoices with approval workflow")
-    with cols[2]:
+        st.caption("Fee note review, approval and billing — Astons Accountants")
+    with cols[1]:
         st.write("")
         st.write(f"**{user['full_name']}**")
         st.caption(
@@ -213,10 +249,6 @@ def sidebar_counts(user):
                               + xc.get("APPROVED_NO_ATTACHMENT", 0))
                 if exceptions:
                     st.metric("Exceptions", exceptions)
-        legacy_pending = db.count_by_status().get("pending_approval", 0)
-        if legacy_pending:
-            st.divider()
-            st.caption(f"Legacy uploads pending: {legacy_pending}")
         st.divider()
         st.caption(
             "All data on this platform stays inside Astons. "
@@ -624,9 +656,11 @@ def team_xero_drafts(user):
                     else:
                         db.xero_set_draft_prep(
                             iid, entity_choice, "/".join(raiser_choice), user["id"])
+                        emailed = xero_watchdog.notify_prepped(d, user["full_name"])
                         st.session_state["tq_flash"] = (
                             "success",
-                            f"{d['invoice_number']} is ready for Ash's approval.")
+                            f"{d['invoice_number']} is ready for Ash's approval"
+                            + (" — he's been emailed." if emailed else "."))
                         st.rerun()
 
     actioned = db.xero_recent_actioned()
@@ -648,9 +682,79 @@ def team_xero_drafts(user):
                                  "re-raise.")
 
 
+def team_my_billing(user):
+    """Team member's own billing dashboard: firm total for context plus
+    their personal billed figure, target progress and fee-note list.
+    Colleagues' individual numbers are not shown."""
+    import pandas as pd
+    import datetime as _dt
+
+    st.subheader("My billing")
+    my_initials = (user.get("initials") or "").strip().upper()
+    if not my_initials:
+        st.info("Your account has no raiser initials yet — ask Ash to set "
+                "them in the Users tab, then log out and back in.")
+        return
+
+    today = _dt.date.today()
+    month_options = []
+    y, m = today.year, today.month
+    for _ in range(12):
+        month_options.append((y, m))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    sel = st.selectbox(
+        "Month", month_options,
+        format_func=lambda ym: _dt.date(ym[0], ym[1], 1).strftime("%B %Y"),
+        key="team_month",
+    )
+    year, month = sel
+    start, end = xero_reports.month_bounds(year, month)
+    entries = xero_reports.entries_for_range(start, end)
+    stats = xero_reports.per_person(entries).get(
+        my_initials, {"net": 0.0, "sole_net": 0.0, "shared_net": 0.0, "count": 0})
+    target = db.billing_target_for(my_initials, start)
+    firm_total = sum(e["net"] for e in entries)
+
+    mcols = st.columns(3)
+    mcols[0].metric("My net billed", fmt_money(stats["net"]))
+    mcols[1].metric(
+        "Of my target",
+        f"{stats['net'] / target:.0%}" if target else "—",
+        delta=(f"target {fmt_money(target)}" if target else "no target set"),
+        delta_color="off",
+    )
+    mcols[2].metric("Firm net billed", fmt_money(firm_total))
+    if stats["shared_net"]:
+        st.caption(f"Sole credit {fmt_money(stats['sole_net'])} · "
+                   f"shared credit {fmt_money(stats['shared_net'])}")
+
+    my_notes = []
+    for e in entries:
+        share = next((s for s in e["splits"] if s["initials"] == my_initials), None)
+        if share:
+            my_notes.append({
+                "Fee note": e["fee_note_no"],
+                "Client": e["client_name"],
+                "My net": round(float(share.get("net") or 0), 2),
+                "Invoice net": round(e["net"], 2),
+                "Date": e["date"],
+            })
+    if my_notes:
+        st.dataframe(pd.DataFrame(my_notes), use_container_width=True,
+                     hide_index=True)
+    else:
+        st.caption("_No approved fee notes for you this month yet._")
+
+
 def render_team_view(user):
     sidebar_counts(user)
-    team_xero_drafts(user)
+    tabs = st.tabs(["Fee notes", "My billing"])
+    with tabs[0]:
+        team_xero_drafts(user)
+    with tabs[1]:
+        team_my_billing(user)
 
 
 # === APPROVER VIEWS ===
@@ -1873,7 +1977,6 @@ def render_approver_view(user):
         "Users",
         "Audit",
         "Xero settings",
-        "Legacy",
     ])
     with tabs[0]:
         approver_xero_queue(user)
@@ -1887,24 +1990,6 @@ def render_approver_view(user):
         approver_audit(user)
     with tabs[5]:
         approver_xero_settings(user)
-    with tabs[6]:
-        st.caption(
-            "The old upload workflow, kept for past records. All new fee "
-            "notes flow BrightManager → Xero → the Xero queue."
-        )
-        legacy_pending = db.count_by_status().get("pending_approval", 0)
-        if legacy_pending:
-            st.warning(f"{legacy_pending} old upload(s) still pending — "
-                       "approve/reject them here or ask the team to "
-                       "re-raise in BrightManager.")
-        with st.expander("Pending approvals", expanded=bool(legacy_pending)):
-            approver_queue(user)
-        with st.expander("Approved (awaiting send)"):
-            approver_archive(user, "approved", "Approved (awaiting send)", "No approved invoices waiting.")
-        with st.expander("Sent"):
-            approver_archive(user, "sent", "Sent", "No sent invoices yet.")
-        with st.expander("Rejected"):
-            approver_archive(user, "rejected", "Rejected", "No rejected invoices.")
 
 
 # === MAIN ===

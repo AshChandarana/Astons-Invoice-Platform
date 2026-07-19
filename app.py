@@ -31,6 +31,7 @@ import auth
 import xero_client
 import xero_sync
 import xero_actions
+import xero_attrib
 import xero_pdf
 import xero_watchdog
 
@@ -793,6 +794,15 @@ def approver_xero_queue(user):
             st.caption(f"Last successful sync: {format_timestamp(last)}")
 
     entity_map = db.xero_entity_map_all()
+    raisers_reg = db.xero_raisers_all(active_only=True)
+    raiser_names = {r["initials"]: r["name"] for r in raisers_reg}
+    known = set(raiser_names)
+    if not raisers_reg:
+        st.info(
+            "No raisers registered yet — add the team's initials in the "
+            "Xero settings tab so fee notes auto-attribute from the "
+            "invoice Reference (e.g. LG/BT)."
+        )
     drafts = db.xero_list_drafts("PENDING_REVIEW")
     if drafts:
         st.write(f"**{len(drafts)}** draft{'s' if len(drafts) != 1 else ''} awaiting review")
@@ -848,7 +858,8 @@ def approver_xero_queue(user):
 
             # --- Actions ---
             derived = xero_pdf.derive_entity(d, entity_map)
-            action_cols = st.columns([3, 2, 2, 3])
+            parsed_raisers = xero_attrib.parse_reference(d.get("reference"), known)
+            action_cols = st.columns([3, 3, 2, 2])
             with action_cols[0]:
                 options = ["AA", "CW"]
                 entity_choice = st.selectbox(
@@ -862,11 +873,31 @@ def approver_xero_queue(user):
                 if derived:
                     st.caption(f"Auto-detected {derived} from tracking/nominals.")
             with action_cols[1]:
+                raiser_choice = st.multiselect(
+                    "Raised by (required)",
+                    options=sorted(known),
+                    default=parsed_raisers,
+                    max_selections=2,
+                    format_func=lambda i: f"{i} — {raiser_names[i]}",
+                    placeholder="Pick 1 or 2 raisers...",
+                    key=f"xq_raisers_{iid}",
+                )
+                if parsed_raisers:
+                    st.caption(f"From reference: {'/'.join(parsed_raisers)}")
+                else:
+                    hint = xero_attrib.unregistered_pair_hint(d.get("reference"), known)
+                    if hint:
+                        st.caption(f"Reference contains '{hint}' — add these "
+                                   "initials in Xero settings to auto-attribute.")
+                monthly_choice = st.checkbox(
+                    "Monthly client", key=f"xq_monthly_{iid}",
+                )
+            with action_cols[2]:
                 if st.button("Approve", key=f"xq_app_{iid}", type="primary",
                              use_container_width=True):
                     st.session_state[f"xq_confirm_app_{iid}"] = True
                     st.session_state.pop(f"xq_confirm_rej_{iid}", None)
-            with action_cols[2]:
+            with action_cols[3]:
                 if st.button("Reject", key=f"xq_rej_{iid}", use_container_width=True):
                     st.session_state[f"xq_confirm_rej_{iid}"] = True
                     st.session_state.pop(f"xq_confirm_app_{iid}", None)
@@ -875,19 +906,31 @@ def approver_xero_queue(user):
                 if not entity_choice:
                     st.error("Choose AA or CW first — it decides which bank "
                              "details print on the fee note.")
+                elif not raiser_choice:
+                    st.error("Pick who raised this fee note first — every "
+                             "invoice must be attributed (add missing initials "
+                             "in Xero settings).")
                 else:
+                    credit = xero_attrib.describe(raiser_choice)
                     st.warning(
                         f"This will set **{d['invoice_number']}** "
                         f"({d['contact_name']}, {fmt_money(d['total'])}) to "
                         f"AUTHORISED in Xero and attach the branded "
-                        f"{entity_choice} fee note to the client-facing invoice."
+                        f"{entity_choice} fee note to the client-facing invoice. "
+                        f"Credit: {credit}"
+                        + (" — split 50/50 unless overridden in settings."
+                           if len(raiser_choice) == 2 else ".")
                     )
                     ccols = st.columns([2, 2, 6])
                     if ccols[0].button("Confirm approve", key=f"xq_capp_{iid}",
                                        type="primary", use_container_width=True):
                         try:
                             with st.spinner("Authorising in Xero and attaching PDF..."):
-                                result = xero_actions.approve_draft(iid, user["id"], entity_choice)
+                                result = xero_actions.approve_draft(
+                                    iid, user["id"], entity_choice,
+                                    raisers=raiser_choice,
+                                    monthly=monthly_choice,
+                                )
                             if result["attachment_ok"]:
                                 st.session_state["xq_flash"] = (
                                     "success",
@@ -928,10 +971,14 @@ def approver_xero_queue(user):
                         try:
                             with st.spinner("Deleting draft in Xero..."):
                                 result = xero_actions.reject_draft(iid, user["id"], reason)
+                            notified = result.get("notified") or []
                             st.session_state["xq_flash"] = (
                                 "success",
                                 f"{result['invoice_number']} deleted in Xero. "
-                                "The raiser should amend and re-raise in BrightManager.",
+                                + (f"Raiser notified at {', '.join(notified)}."
+                                   if notified else
+                                   "The raiser should amend and re-raise in "
+                                   "BrightManager (no raiser email on file to notify)."),
                             )
                             st.session_state.pop(f"xq_confirm_rej_{iid}", None)
                             st.rerun()
@@ -956,6 +1003,14 @@ def approver_xero_queue(user):
                 with cols2[1]:
                     st.write(fmt_money(a["total"]))
                     st.caption(a["entity"] or "")
+                    full_row = db.xero_get_draft(a["invoice_id"]) or {}
+                    bits = []
+                    if full_row.get("raiser_pair"):
+                        bits.append(f"Raised by {full_row['raiser_pair']}")
+                    if full_row.get("monthly") is not None:
+                        bits.append("Monthly" if full_row["monthly"] else "Non-monthly")
+                    if bits:
+                        st.caption(" · ".join(bits))
                 with cols2[2]:
                     if a["hub_status"] == "APPROVED":
                         st.success("Approved", icon="✅")
@@ -1178,6 +1233,72 @@ def approver_xero_settings(user):
                     st.rerun()
         if not tracking_seen and not accounts_seen:
             st.info("No tracking options or nominal codes seen in synced drafts yet.")
+
+        st.divider()
+        st.write("**Raisers**")
+        st.caption(
+            "The initials the team puts in the invoice Reference when "
+            "raising in BrightManager (e.g. LG/BT for shared credit). "
+            "Email is used to notify a raiser when their fee note is "
+            "rejected."
+        )
+        with st.form("new_raiser_form", clear_on_submit=True):
+            rcols = st.columns([2, 4, 4, 2])
+            nr_initials = rcols[0].text_input("Initials", max_chars=3, placeholder="LG")
+            nr_name = rcols[1].text_input("Name", placeholder="Laura Green")
+            nr_email = rcols[2].text_input("Email (optional)",
+                                           placeholder="lg@astonsaccountants.co.uk")
+            rcols[3].write("")
+            add_raiser = rcols[3].form_submit_button("Add", use_container_width=True)
+        if add_raiser:
+            if not nr_initials.strip() or not nr_name.strip():
+                st.error("Initials and name are both required.")
+            elif not nr_initials.strip().isalpha() or len(nr_initials.strip()) < 2:
+                st.error("Initials must be 2–3 letters.")
+            else:
+                db.xero_raiser_upsert(nr_initials, nr_name, nr_email)
+                st.rerun()
+        for r in db.xero_raisers_all():
+            rcols = st.columns([2, 4, 4, 2])
+            rcols[0].write(f"**{r['initials']}**")
+            rcols[1].write(r["name"] + ("" if r["active"] else "  _(inactive)_"))
+            rcols[2].caption(r["email"] or "no email")
+            label = "Deactivate" if r["active"] else "Reactivate"
+            if rcols[3].button(label, key=f"raiser_toggle_{r['initials']}",
+                               use_container_width=True):
+                db.xero_raiser_set_active(r["initials"], not bool(r["active"]))
+                st.rerun()
+
+        st.write("**Shared-credit split overrides**")
+        st.caption(
+            "Pairs split the net fee 50/50 unless overridden here. The "
+            "percentage is the FIRST-named person's share (e.g. LG/BT at "
+            "60% gives LG 60%, BT 40%)."
+        )
+        with st.form("new_split_form", clear_on_submit=True):
+            scols = st.columns([3, 3, 2, 4])
+            sp_pair = scols[0].text_input("Pair", placeholder="LG/BT")
+            sp_share = scols[1].number_input("First person's %", min_value=1,
+                                             max_value=99, value=50)
+            scols[2].write("")
+            add_split = scols[2].form_submit_button("Set", use_container_width=True)
+        if add_split:
+            pair_clean = sp_pair.strip().upper()
+            if not re.fullmatch(r"[A-Z]{2,3}/[A-Z]{2,3}", pair_clean):
+                st.error("Pair must look like LG/BT.")
+            else:
+                db.xero_split_override_set(pair_clean, sp_share / 100)
+                st.rerun()
+        for o in db.xero_split_overrides_all():
+            scols = st.columns([3, 3, 2, 4])
+            first, second = o["pair"].split("/")
+            scols[0].write(f"**{o['pair']}**")
+            scols[1].caption(f"{first} {o['first_share']:.0%} / "
+                             f"{second} {1 - o['first_share']:.0%}")
+            if scols[2].button("Remove", key=f"split_del_{o['pair']}",
+                               use_container_width=True):
+                db.xero_split_override_set(o["pair"], None)
+                st.rerun()
 
         st.divider()
         st.write("**Watchdog & alerts**")

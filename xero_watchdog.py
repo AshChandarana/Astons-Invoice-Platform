@@ -63,12 +63,16 @@ def _graph_token() -> str:
     return resp.json()["access_token"]
 
 
-def send_email(subject: str, html_body: str) -> bool:
-    """Send via Graph. Returns True on success; failures are logged to
-    the sync log (never silent) and False is returned."""
+def send_email(subject: str, html_body: str, to: list = None) -> bool:
+    """Send via Graph to `to` (defaults to the watchdog alert recipient).
+    Returns True on success; failures are logged to the sync log (never
+    silent) and False is returned."""
     if not email_configured():
         db.xero_kv_set("watchdog_email_status",
                        "Email not configured — MS_CLIENT_ID/SECRET/TENANT_ID/SENDER_EMAIL missing.")
+        return False
+    recipients = [a for a in (to or [alert_recipient()]) if a and a.strip()]
+    if not recipients:
         return False
     try:
         token = _graph_token()
@@ -81,7 +85,7 @@ def send_email(subject: str, html_body: str) -> bool:
                     "subject": subject,
                     "body": {"contentType": "HTML", "content": html_body},
                     "toRecipients": [
-                        {"emailAddress": {"address": alert_recipient()}}
+                        {"emailAddress": {"address": a.strip()}} for a in recipients
                     ],
                 },
                 "saveToSentItems": "true",

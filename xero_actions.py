@@ -46,9 +46,15 @@ def _require_still_draft(live: dict, invoice_id: str) -> None:
         )
 
 
-def approve_draft(invoice_id: str, user_id: int, entity: str) -> dict:
+def approve_draft(invoice_id: str, user_id: int, entity: str,
+                  raisers: list = None, monthly: bool = False) -> dict:
     """Approve: AUTHORISED in Xero + branded PDF attached with
-    IncludeOnline. Returns {'attachment_ok': bool, 'error': str|None}."""
+    IncludeOnline. Raiser attribution is mandatory (SPEC section 3).
+    Returns {'attachment_ok': bool, 'error': str|None}."""
+    if not raisers:
+        raise ActionBlocked("Pick who raised this fee note before approving — "
+                            "every invoice must be attributed.")
+
     draft = db.xero_get_draft(invoice_id)
     if not draft:
         raise ActionBlocked("Draft not found in the Hub database.")
@@ -96,9 +102,14 @@ def approve_draft(invoice_id: str, user_id: int, entity: str) -> dict:
     except Exception as exc:
         attachment_ok, error = False, str(exc)[:500]
 
+    import xero_attrib
     db.xero_mark_approved(
         invoice_id, user_id, entity, pdf_bytes, filename,
         attachment_ok=attachment_ok, error=error,
+        raiser_pair="/".join(raisers),
+        split_json=xero_attrib.compute_split(raisers, draft.get("sub_total")),
+        monthly=monthly,
+        client_code=(contact.get("AccountNumber") or "").strip() or None,
     )
     return {"attachment_ok": attachment_ok, "error": error,
             "invoice_number": draft["invoice_number"]}
@@ -149,4 +160,32 @@ def reject_draft(invoice_id: str, user_id: int, reason: str) -> dict:
         {"InvoiceID": invoice_id, "Status": "DELETED"},
     )
     db.xero_mark_rejected(invoice_id, user_id, reason.strip())
-    return {"invoice_number": draft["invoice_number"]}
+
+    # Notify the raiser if the reference identifies one with an email
+    # (SPEC 2.3). Best-effort: a send failure never undoes the reject —
+    # it logs to the sync log and surfaces in Exceptions.
+    import html as html_mod
+    import xero_attrib
+    import xero_watchdog
+    notified = []
+    raisers = xero_attrib.parse_reference(draft.get("reference"))
+    emails = xero_attrib.raiser_emails(raisers)
+    if emails:
+        body = (
+            f"<p>Your fee note <b>{html_mod.escape(draft['invoice_number'] or '')}</b> "
+            f"for <b>{html_mod.escape(draft['contact_name'] or '')}</b> "
+            f"({'£' + format(draft['total'] or 0, ',.2f')}) was rejected in the "
+            f"Invoice Hub.</p>"
+            f"<p><b>Reason:</b> {html_mod.escape(reason.strip())}</p>"
+            f"<p>The draft has been deleted in Xero — please amend and "
+            f"re-raise it in BrightManager.</p>"
+        )
+        if xero_watchdog.send_email(
+            f"Fee note {draft['invoice_number']} rejected — please re-raise",
+            body, to=emails,
+        ):
+            notified = emails
+    db.record_xero_event(user_id, "xero_reject_notify",
+                         f"xero_invoice_id={invoice_id} "
+                         f"notified={','.join(notified) or 'none'}")
+    return {"invoice_number": draft["invoice_number"], "notified": notified}

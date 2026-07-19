@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS xero_drafts (
     action_error         TEXT,
     branded_pdf          BLOB,
     branded_pdf_filename TEXT,
+    raiser_pair          TEXT,
+    split_json           TEXT,
+    monthly              INTEGER,
+    client_code          TEXT,
     first_seen_at        TEXT NOT NULL,
     last_seen_at         TEXT NOT NULL
 )
@@ -170,6 +174,23 @@ CREATE TABLE IF NOT EXISTS xero_entity_map (
     PRIMARY KEY (match_type, match_value)
 );
 
+-- Raiser registry (SPEC section 3): the initials the team puts in the
+-- invoice Reference, mapped to a person. Separate from Hub users — not
+-- every raiser has a Hub login.
+CREATE TABLE IF NOT EXISTS xero_raisers (
+    initials TEXT PRIMARY KEY,
+    name     TEXT NOT NULL,
+    email    TEXT,
+    active   INTEGER NOT NULL DEFAULT 1
+);
+
+-- Shared-credit split overrides: default is 50/50, a pair like 'AB/CD'
+-- can override the first-named person's share (SPEC section 3).
+CREATE TABLE IF NOT EXISTS xero_split_overrides (
+    pair        TEXT PRIMARY KEY,
+    first_share REAL NOT NULL CHECK(first_share > 0 AND first_share < 1)
+);
+
 -- Every poll attempt is logged; failures surface in the exceptions tab.
 CREATE TABLE IF NOT EXISTS xero_sync_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,11 +234,26 @@ def _migrate_xero_drafts_v2(conn) -> None:
     )
 
 
+def _ensure_drafts_columns(conn) -> None:
+    """Additive columns (no CHECK changes) arrive via plain ALTERs so an
+    existing table gains them without a rebuild."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(xero_drafts)")}
+    for name, ddl in [
+        ("raiser_pair", "TEXT"),
+        ("split_json", "TEXT"),
+        ("monthly", "INTEGER"),
+        ("client_code", "TEXT"),
+    ]:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE xero_drafts ADD COLUMN {name} {ddl}")
+
+
 def init_db() -> None:
     """Create tables if they don't exist. Safe to call on every app boot."""
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         _migrate_xero_drafts_v2(conn)
+        _ensure_drafts_columns(conn)
 
     # Seed initial approver if DB has no users at all
     seed_initial_user_if_empty()
@@ -711,7 +747,9 @@ def xero_get_draft(invoice_id: str):
 
 def xero_mark_approved(invoice_id: str, user_id: int, entity: str,
                        pdf_bytes: bytes, pdf_filename: str,
-                       attachment_ok: bool, error: str = None) -> None:
+                       attachment_ok: bool, error: str = None,
+                       raiser_pair: str = None, split_json: str = None,
+                       monthly: bool = None, client_code: str = None) -> None:
     now = dt.datetime.utcnow().isoformat()
     status = "APPROVED" if attachment_ok else "APPROVED_NO_ATTACHMENT"
     with get_conn() as conn:
@@ -720,13 +758,18 @@ def xero_mark_approved(invoice_id: str, user_id: int, entity: str,
             UPDATE xero_drafts
             SET hub_status = ?, entity = ?, decided_by_user_id = ?, decided_at = ?,
                 action_error = ?, branded_pdf = ?, branded_pdf_filename = ?,
+                raiser_pair = ?, split_json = ?, monthly = ?, client_code = ?,
                 xero_status = 'AUTHORISED'
             WHERE invoice_id = ?
             """,
-            (status, entity, user_id, now, error, pdf_bytes, pdf_filename, invoice_id),
+            (status, entity, user_id, now, error, pdf_bytes, pdf_filename,
+             raiser_pair, split_json,
+             None if monthly is None else (1 if monthly else 0),
+             client_code, invoice_id),
         )
         _write_audit(conn, user_id, None, "xero_approve",
                      f"xero_invoice_id={invoice_id} entity={entity} "
+                     f"raisers={raiser_pair or '-'} monthly={monthly} "
                      f"attachment={'ok' if attachment_ok else 'FAILED: ' + str(error)}")
 
 
@@ -816,6 +859,61 @@ def xero_count_drafts() -> dict:
             "SELECT hub_status, COUNT(*) AS n FROM xero_drafts GROUP BY hub_status"
         ).fetchall()
         return {r["hub_status"]: r["n"] for r in rows}
+
+
+# === XERO: RAISERS & SPLITS (SPEC section 3) ===
+
+def xero_raisers_all(active_only: bool = False):
+    with get_conn() as conn:
+        sql = "SELECT * FROM xero_raisers"
+        if active_only:
+            sql += " WHERE active = 1"
+        rows = conn.execute(sql + " ORDER BY initials").fetchall()
+        return [dict(r) for r in rows]
+
+
+def xero_raiser_upsert(initials: str, name: str, email: str = None) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO xero_raisers (initials, name, email, active)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(initials) DO UPDATE SET
+                name = excluded.name, email = excluded.email
+            """,
+            (initials.strip().upper(), name.strip(), (email or "").strip() or None),
+        )
+
+
+def xero_raiser_set_active(initials: str, active: bool) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE xero_raisers SET active = ? WHERE initials = ?",
+            (1 if active else 0, initials),
+        )
+
+
+def xero_split_overrides_all():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM xero_split_overrides ORDER BY pair"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def xero_split_override_set(pair: str, first_share) -> None:
+    """first_share None removes the override (back to 50/50)."""
+    with get_conn() as conn:
+        if first_share is None:
+            conn.execute("DELETE FROM xero_split_overrides WHERE pair = ?", (pair,))
+        else:
+            conn.execute(
+                """
+                INSERT INTO xero_split_overrides (pair, first_share) VALUES (?, ?)
+                ON CONFLICT(pair) DO UPDATE SET first_share = excluded.first_share
+                """,
+                (pair.strip().upper(), float(first_share)),
+            )
 
 
 # === XERO: SYNC LOG ===

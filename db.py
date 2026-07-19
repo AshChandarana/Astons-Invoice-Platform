@@ -191,6 +191,33 @@ CREATE TABLE IF NOT EXISTS xero_split_overrides (
     first_share REAL NOT NULL CHECK(first_share > 0 AND first_share < 1)
 );
 
+-- Monthly billing targets (SPEC 4.1): per raiser initials or 'FIRM',
+-- with effective-from dates so history is preserved.
+CREATE TABLE IF NOT EXISTS billing_targets (
+    person         TEXT NOT NULL,
+    effective_from TEXT NOT NULL,
+    monthly_target REAL NOT NULL,
+    PRIMARY KEY (person, effective_from)
+);
+
+-- Historical fee notes imported from the Bill Number List workbook
+-- (SPEC 6.2) so trends and prior-year comparisons work from launch.
+CREATE TABLE IF NOT EXISTS billing_imports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fee_note_no TEXT,
+    entity      TEXT,
+    client_code TEXT,
+    client_name TEXT,
+    net         REAL,
+    issued_by   TEXT,
+    issued_on   TEXT,
+    monthly     INTEGER,
+    source_tab  TEXT,
+    imported_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_billing_imports_issued ON billing_imports(issued_on);
+
 -- Every poll attempt is logged; failures surface in the exceptions tab.
 CREATE TABLE IF NOT EXISTS xero_sync_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -914,6 +941,105 @@ def xero_split_override_set(pair: str, first_share) -> None:
                 """,
                 (pair.strip().upper(), float(first_share)),
             )
+
+
+# === BILLING: TARGETS & IMPORTS (SPEC 4 / 6.2) ===
+
+def billing_targets_all():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM billing_targets ORDER BY person, effective_from DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def billing_target_set(person: str, effective_from: str, monthly_target) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO billing_targets (person, effective_from, monthly_target)
+            VALUES (?, ?, ?)
+            ON CONFLICT(person, effective_from) DO UPDATE SET
+                monthly_target = excluded.monthly_target
+            """,
+            (person.strip().upper(), effective_from, float(monthly_target)),
+        )
+
+
+def billing_target_delete(person: str, effective_from: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM billing_targets WHERE person = ? AND effective_from = ?",
+            (person, effective_from),
+        )
+
+
+def billing_target_for(person: str, month_start: str, targets: list = None):
+    """Target in force for the month starting month_start (latest
+    effective_from <= month_start). None if never set."""
+    rows = targets if targets is not None else billing_targets_all()
+    candidates = [t for t in rows
+                  if t["person"] == person and t["effective_from"] <= month_start]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda t: t["effective_from"])["monthly_target"]
+
+
+def billing_imports_add(rows: list) -> int:
+    now = dt.datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO billing_imports (
+                fee_note_no, entity, client_code, client_name, net,
+                issued_by, issued_on, monthly, source_tab, imported_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(r.get("fee_note_no"), r.get("entity"), r.get("client_code"),
+              r.get("client_name"), r.get("net"), r.get("issued_by"),
+              r.get("issued_on"), r.get("monthly"), r.get("source_tab"), now)
+             for r in rows],
+        )
+    return len(rows)
+
+
+def billing_imports_clear() -> int:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM billing_imports")
+        return cur.rowcount
+
+
+def billing_imports_range(start: str, end: str):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM billing_imports WHERE issued_on >= ? AND issued_on < ? "
+            "ORDER BY issued_on",
+            (start, end),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def billing_imports_count() -> int:
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) AS n FROM billing_imports").fetchone()["n"]
+
+
+def xero_approved_range(start: str, end: str):
+    """Hub-approved Xero invoices with invoice DATE in [start, end)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT invoice_id, invoice_number, contact_name, client_code,
+                   sub_total, total_tax, total, date, entity, raiser_pair,
+                   split_json, monthly, decided_at
+            FROM xero_drafts
+            WHERE hub_status IN ('APPROVED', 'APPROVED_NO_ATTACHMENT')
+              AND date >= ? AND date < ?
+            ORDER BY date
+            """,
+            (start, end),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # === XERO: SYNC LOG ===

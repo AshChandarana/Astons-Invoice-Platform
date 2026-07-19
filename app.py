@@ -33,7 +33,10 @@ import xero_sync
 import xero_actions
 import xero_attrib
 import xero_pdf
+import xero_recon
+import xero_reports
 import xero_watchdog
+import billing_import
 
 UK_TZ = ZoneInfo("Europe/London")
 from generate_invoice import (
@@ -1131,6 +1134,264 @@ def approver_xero_exceptions(user):
             )
 
 
+RAG_ICONS = {"green": "🟢", "amber": "🟠", "red": "🔴", None: "—"}
+
+
+def approver_dashboard(user):
+    import pandas as pd
+    import datetime as _dt
+
+    st.subheader("Billing dashboard")
+    show_flash("dash_flash")
+
+    # --- Month picker (last 18 months) ---
+    today = _dt.date.today()
+    month_options = []
+    y, m = today.year, today.month
+    for _ in range(18):
+        month_options.append((y, m))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    sel = st.selectbox(
+        "Month", month_options,
+        format_func=lambda ym: _dt.date(ym[0], ym[1], 1).strftime("%B %Y"),
+    )
+    year, month = sel
+    start, end = xero_reports.month_bounds(year, month)
+    entries = xero_reports.entries_for_range(start, end)
+    targets = db.billing_targets_all()
+
+    if not entries and db.billing_imports_count() == 0:
+        st.info(
+            "No fee notes recorded for this month yet. Data arrives here "
+            "from approvals in the Xero queue, and from the historical "
+            "Bill Number List import below."
+        )
+
+    # --- Firm view (SPEC 4.2) ---
+    split = xero_reports.firm_split(entries)
+    firm_target = db.billing_target_for("FIRM", start, targets)
+    firm_rag = xero_reports.rag_and_projection(split["total"], firm_target, year, month)
+    mcols = st.columns(4)
+    mcols[0].metric(
+        "Firm net billed",
+        fmt_money(split["total"]),
+        delta=(f"{RAG_ICONS[firm_rag['rag']]} target {fmt_money(firm_target)}"
+               if firm_target else None),
+        delta_color="off",
+    )
+    mcols[1].metric("Projected month-end", fmt_money(firm_rag["projection"]),
+                    delta=(f"{firm_rag['pct_of_target']:.0%} of target"
+                           if firm_rag["pct_of_target"] else None),
+                    delta_color="off")
+    mcols[2].metric("Monthly / Non-monthly",
+                    f"{fmt_money(split['monthly'])} / {fmt_money(split['non_monthly'])}")
+    mcols[3].metric("AA / CW",
+                    f"{fmt_money(split['aa'])} / {fmt_money(split['cw'])}")
+    if split["entity_untagged"]:
+        st.caption(f"{fmt_money(split['entity_untagged'])} net not yet tagged AA/CW.")
+
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        st.caption("Cumulative net this month vs prior-months average")
+        curve = xero_reports.cumulative_curve(entries, year, month)
+        baseline = xero_reports.average_prior_curve(year, month)
+        if curve and any(curve):
+            frame = {"This month": curve}
+            if baseline:
+                frame["Prior avg"] = (baseline + [baseline[-1]] *
+                                      len(curve))[:len(curve)]
+            st.line_chart(pd.DataFrame(frame,
+                                       index=range(1, len(curve) + 1)))
+        else:
+            st.caption("_No data yet._")
+    with chart_cols[1]:
+        st.caption("12-month net billed vs same month prior year")
+        trend = xero_reports.twelve_month_trend(year, month)
+        if any(t["net"] or t["prior_year_net"] for t in trend):
+            st.bar_chart(pd.DataFrame(
+                {"Net": [t["net"] for t in trend],
+                 "Prior year": [t["prior_year_net"] for t in trend]},
+                index=[t["month"] for t in trend]))
+        else:
+            st.caption("_No data yet._")
+
+    # --- Per-person view (SPEC 4.1) ---
+    st.write("**Per person**")
+    people = xero_reports.per_person(entries)
+    known_people = sorted(set(list(people.keys())
+                              + [t["person"] for t in targets if t["person"] != "FIRM"]))
+    if not known_people:
+        st.caption("_No attributed fee notes this month._")
+    for person in known_people:
+        stats = people.get(person, {"net": 0.0, "sole_net": 0.0,
+                                    "shared_net": 0.0, "count": 0})
+        target = db.billing_target_for(person, start, targets)
+        rag = xero_reports.rag_and_projection(stats["net"], target, year, month)
+        cols = st.columns([2, 2, 2, 2, 3])
+        cols[0].write(f"{RAG_ICONS[rag['rag']]} **{person}**")
+        cols[1].write(fmt_money(stats["net"]))
+        cols[1].caption(f"of {fmt_money(target)} target" if target else "no target set")
+        cols[2].write(fmt_money(rag["projection"]))
+        cols[2].caption(f"projected ({rag['pct_of_target']:.0%})"
+                        if rag["pct_of_target"] else "projected")
+        cols[3].caption(f"Sole {fmt_money(stats['sole_net'])}\n\n"
+                        f"Shared {fmt_money(stats['shared_net'])}")
+        with cols[4]:
+            with st.expander(f"{stats['count']} fee note(s)"):
+                for e in entries:
+                    share = next((s for s in e["splits"]
+                                  if s["initials"] == person), None)
+                    if share:
+                        st.caption(
+                            f"{e['fee_note_no']} — {e['client_name']} — "
+                            f"{fmt_money(share['net'])}"
+                            + (f" (of {fmt_money(e['net'])})"
+                               if share.get('share', 1) < 1 else "")
+                            + f" — {e['date']}"
+                        )
+
+    # --- Register + export (SPEC 4.3) ---
+    st.write("**Fee note register**")
+    register = xero_reports.register_rows(entries)
+    if register:
+        frame = pd.DataFrame(register)
+        st.dataframe(frame, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download register CSV",
+            data=frame.to_csv(index=False).encode("utf-8"),
+            file_name=f"fee_note_register_{year}-{month:02d}.csv",
+            mime="text/csv",
+        )
+    else:
+        st.caption("_Nothing recorded for this month._")
+
+    # --- Reconciliation (SPEC 4.3) ---
+    st.write("**Reconciliation vs Xero**")
+    st.caption("Sums the Hub's record of the month against Xero's "
+               "authorised invoices — the automatic 'Check = 0'.")
+    if st.button("Run reconciliation for this month"):
+        try:
+            with st.spinner("Fetching authorised invoices from Xero..."):
+                recon = xero_recon.reconcile_month(year, month)
+            if recon["clean"]:
+                st.success(
+                    f"Reconciles to the penny: Hub {fmt_money(recon['hub_total_net'])} "
+                    f"= Xero {fmt_money(recon['xero_total_net'])} net."
+                )
+            else:
+                st.error(
+                    f"Variance {fmt_money(recon['variance'])}: "
+                    f"Hub {fmt_money(recon['hub_total_net'])} vs "
+                    f"Xero {fmt_money(recon['xero_total_net'])} net."
+                )
+                for i in recon["only_in_xero"]:
+                    st.warning(f"In Xero but not the Hub: {i['invoice_number']} "
+                               f"{i['contact']} {fmt_money(i['net'])} net "
+                               "(authorised outside the Hub?)")
+                for e in recon["only_in_hub"]:
+                    st.warning(f"In the Hub but not Xero: {e['fee_note_no']} "
+                               f"{e['client_name']} {fmt_money(e['net'])} net "
+                               "(voided in Xero? imported row?)")
+                for x in recon["amount_mismatch"]:
+                    st.warning(f"Amount differs: {x['invoice_number']} — Hub "
+                               f"{fmt_money(x['hub_net'])} vs Xero "
+                               f"{fmt_money(x['xero_net'])}")
+        except Exception as exc:
+            st.error(f"Reconciliation failed: {exc}")
+
+    # --- Targets editor (SPEC 4.1) ---
+    with st.expander("Monthly targets"):
+        st.caption(
+            "Targets per person (raiser initials) plus a FIRM total. "
+            "Effective-from dates preserve history — set a new amount "
+            "from a given month and old months keep the old target."
+        )
+        raiser_opts = ["FIRM"] + [r["initials"] for r in db.xero_raisers_all()]
+        with st.form("target_form", clear_on_submit=True):
+            tcols = st.columns([3, 3, 3, 2])
+            t_person = tcols[0].selectbox("Person", raiser_opts)
+            t_from = tcols[1].date_input("Effective from",
+                                         value=_dt.date(today.year, today.month, 1))
+            t_amount = tcols[2].number_input("Monthly target £", min_value=0.0,
+                                             step=500.0, format="%.2f")
+            tcols[3].write("")
+            t_add = tcols[3].form_submit_button("Set", use_container_width=True)
+        if t_add:
+            if t_amount <= 0:
+                st.error("Target must be above zero.")
+            else:
+                db.billing_target_set(t_person,
+                                      t_from.replace(day=1).isoformat(), t_amount)
+                st.session_state["dash_flash"] = (
+                    "success", f"Target set: {t_person} "
+                    f"{fmt_money(t_amount)}/month from "
+                    f"{t_from.replace(day=1).strftime('%B %Y')}.")
+                st.rerun()
+        for t in targets:
+            tcols = st.columns([3, 3, 3, 2])
+            tcols[0].write(f"**{t['person']}**")
+            tcols[1].caption(f"from {format_date(t['effective_from'])}")
+            tcols[2].write(fmt_money(t["monthly_target"]))
+            if tcols[3].button("Delete",
+                               key=f"tdel_{t['person']}_{t['effective_from']}",
+                               use_container_width=True):
+                db.billing_target_delete(t["person"], t["effective_from"])
+                st.rerun()
+
+    # --- Historical import (SPEC 6.2) ---
+    with st.expander(
+        f"Historical import — Bill Number List "
+        f"({db.billing_imports_count()} rows imported)"
+    ):
+        st.caption(
+            "Upload the Bill Number List workbook. Every tab is parsed "
+            "(fee note no., entity, client code, net, issued by, issued "
+            "on); nothing is saved until you confirm the preview."
+        )
+        upload = st.file_uploader("Bill Number List workbook",
+                                  type=["xlsx", "xlsm"], key="bnl_upload")
+        if upload is not None:
+            cache_key = f"bnl_parse_{upload.name}_{upload.size}"
+            if cache_key not in st.session_state:
+                with st.spinner("Parsing workbook..."):
+                    try:
+                        st.session_state[cache_key] = billing_import.parse_workbook(
+                            upload.getbuffer().tobytes())
+                    except Exception as exc:
+                        st.session_state[cache_key] = {"error": str(exc)}
+            parsed = st.session_state[cache_key]
+            if parsed.get("error"):
+                st.error(f"Couldn't parse the workbook: {parsed['error']}")
+            else:
+                st.write(f"**{len(parsed['rows'])}** rows parsed from "
+                         f"{len(parsed['sheets_parsed'])} tab(s); "
+                         f"{len(parsed['sheets_skipped'])} tab(s) skipped.")
+                if parsed["sheets_skipped"]:
+                    st.caption("Skipped (no recognisable header row): "
+                               + ", ".join(parsed["sheets_skipped"][:20]))
+                for issue in parsed["issues"][:30]:
+                    st.warning(issue)
+                if parsed["rows"]:
+                    st.dataframe(pd.DataFrame(parsed["rows"][:20]),
+                                 use_container_width=True, hide_index=True)
+                    replace = st.checkbox(
+                        "Replace all previously imported rows",
+                        value=db.billing_imports_count() > 0)
+                    if st.button(f"Import {len(parsed['rows'])} rows",
+                                 type="primary"):
+                        if replace:
+                            db.billing_imports_clear()
+                        n = db.billing_imports_add(parsed["rows"])
+                        db.record_xero_event(user["id"], "billing_import",
+                                             f"rows={n} file={upload.name}")
+                        st.session_state.pop(cache_key, None)
+                        st.session_state["dash_flash"] = (
+                            "success", f"Imported {n} historical fee notes.")
+                        st.rerun()
+
+
 def approver_xero_settings(user):
     st.subheader("Xero settings")
 
@@ -1349,6 +1610,7 @@ def render_approver_view(user):
     sidebar_counts(user)
     tabs = st.tabs([
         "Xero queue",
+        "Dashboard",
         "Exceptions",
         "Pending approvals",
         "Approved",
@@ -1361,20 +1623,22 @@ def render_approver_view(user):
     with tabs[0]:
         approver_xero_queue(user)
     with tabs[1]:
-        approver_xero_exceptions(user)
+        approver_dashboard(user)
     with tabs[2]:
-        approver_queue(user)
+        approver_xero_exceptions(user)
     with tabs[3]:
-        approver_archive(user, "approved", "Approved (awaiting send)", "No approved invoices waiting.")
+        approver_queue(user)
     with tabs[4]:
-        approver_archive(user, "sent", "Sent", "No sent invoices yet.")
+        approver_archive(user, "approved", "Approved (awaiting send)", "No approved invoices waiting.")
     with tabs[5]:
-        approver_archive(user, "rejected", "Rejected", "No rejected invoices.")
+        approver_archive(user, "sent", "Sent", "No sent invoices yet.")
     with tabs[6]:
-        approver_users(user)
+        approver_archive(user, "rejected", "Rejected", "No rejected invoices.")
     with tabs[7]:
-        approver_audit(user)
+        approver_users(user)
     with tabs[8]:
+        approver_audit(user)
+    with tabs[9]:
         approver_xero_settings(user)
 
 

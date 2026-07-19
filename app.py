@@ -66,10 +66,30 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Crisp logo in the app chrome's top-left, same placement as MyAstons
-# and the client onboarding app (the 800px source renders sharply here,
-# unlike the scaled st.image header it replaces).
-st.logo("astons_logo.png", size="large")
+@st.cache_data
+def _logo_b64() -> str:
+    import base64
+    logo_path = Path(__file__).parent / "astons_logo.png"
+    return base64.b64encode(logo_path.read_bytes()).decode("ascii")
+
+
+def sidebar_logo():
+    """Top-left logo block, replicated from Launchpad (client
+    onboarding) / MyAstons: 160px logo (exact fifth of the 800px source,
+    so it scales sharply) with the app name beneath in the house style."""
+    st.markdown(
+        f"""
+        <div style="text-align:center; padding: 0 0 10px;">
+            <img src="data:image/png;base64,{_logo_b64()}"
+                 style="width:160px; max-width:100%;" alt="Astons"/>
+            <p style="color:{ASTONS_DARK_GREEN}; font-size:0.75rem;
+                      font-weight:600; margin:0.25rem 0 0;">Launchpad</p>
+        </div>
+        <hr style="margin:0 0 12px; border:none;
+                   border-top:1px solid {ASTONS_BORDER};"/>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 ASTONS_DARK_GREEN = "#1a5c2e"
@@ -201,6 +221,7 @@ def fmt_money(value) -> str:
 
 def sidebar_counts(user):
     with st.sidebar:
+        sidebar_logo()
         if xero_client.is_connected():
             xc = db.xero_count_drafts()
             st.subheader("Fee notes")

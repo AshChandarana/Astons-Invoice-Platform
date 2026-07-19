@@ -63,10 +63,12 @@ def _graph_token() -> str:
     return resp.json()["access_token"]
 
 
-def send_email(subject: str, html_body: str, to: list = None) -> bool:
+def send_email(subject: str, html_body: str, to: list = None,
+               attachments: list = None) -> bool:
     """Send via Graph to `to` (defaults to the watchdog alert recipient).
-    Returns True on success; failures are logged to the sync log (never
-    silent) and False is returned."""
+    attachments: [{'name': str, 'bytes': bytes}] — e.g. the branded fee
+    note PDF. Returns True on success; failures are logged to the sync
+    log (never silent) and False is returned."""
     if not email_configured():
         db.xero_kv_set("watchdog_email_status",
                        "Email not configured — MS_CLIENT_ID/SECRET/TENANT_ID/SENDER_EMAIL missing.")
@@ -75,22 +77,31 @@ def send_email(subject: str, html_body: str, to: list = None) -> bool:
     if not recipients:
         return False
     try:
+        import base64
+        message = {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": [
+                {"emailAddress": {"address": a.strip()}} for a in recipients
+            ],
+        }
+        if attachments:
+            message["attachments"] = [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": a["name"],
+                    "contentType": "application/pdf",
+                    "contentBytes": base64.b64encode(a["bytes"]).decode("ascii"),
+                }
+                for a in attachments
+            ]
         token = _graph_token()
         resp = requests.post(
             GRAPH_SENDMAIL_URL.format(sender=os.environ["MS_SENDER_EMAIL"].strip()),
             headers={"Authorization": f"Bearer {token}",
                      "Content-Type": "application/json"},
-            json={
-                "message": {
-                    "subject": subject,
-                    "body": {"contentType": "HTML", "content": html_body},
-                    "toRecipients": [
-                        {"emailAddress": {"address": a.strip()}} for a in recipients
-                    ],
-                },
-                "saveToSentItems": "true",
-            },
-            timeout=30,
+            json={"message": message, "saveToSentItems": "true"},
+            timeout=60,
         )
         if resp.status_code == 202:
             db.xero_kv_set("watchdog_email_status", "ok")

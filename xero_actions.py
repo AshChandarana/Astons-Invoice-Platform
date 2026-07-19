@@ -154,11 +154,14 @@ def approve_draft(invoice_id: str, user_id: int, entity: str,
             f"<p>Your fee note <b>{html_mod.escape(draft['invoice_number'] or '')}</b> "
             f"for <b>{html_mod.escape(draft['contact_name'] or '')}</b> "
             f"({'£' + format(draft['total'] or 0, ',.2f')}) has been approved.</p>"
-            f"<p>It is now authorised in Xero with the branded fee note "
-            f"attached to the client-facing invoice.</p>"
+            f"<p>The branded fee note is attached — send it on to the "
+            f"client. It is also on the invoice in Xero (and the client's "
+            f"online invoice link).</p>"
         )
         if xero_watchdog.send_email(
-            f"Fee note {draft['invoice_number']} approved", body, to=emails,
+            f"Fee note {draft['invoice_number']} approved — ready to send",
+            body, to=emails,
+            attachments=[{"name": filename, "bytes": pdf_bytes}],
         ):
             notified = emails
     db.record_xero_event(user_id, "xero_approve_notify",

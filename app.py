@@ -637,17 +637,30 @@ def team_xero_drafts(user):
         st.write("**Recently actioned by Ash**")
         for a in actioned[:30]:
             with st.container(border=True):
-                cols = st.columns([3, 2, 4])
+                cols = st.columns([3, 2, 4, 2])
                 cols[0].write(f"**{a['contact_name']}**")
                 cols[0].caption(a["invoice_number"] or "")
                 cols[1].write(fmt_money(a["total"]))
                 with cols[2]:
                     if a["hub_status"].startswith("APPROVED"):
-                        st.success(f"Approved {format_timestamp(a['decided_at'])}")
+                        st.success(f"Approved {format_timestamp(a['decided_at'])} "
+                                   "— send the fee note to the client.")
                     else:
                         st.error(f"Rejected: {a['reject_reason']} — delete the "
                                  "old invoice in BrightManager, amend, and "
                                  "re-raise.")
+                with cols[3]:
+                    if a["hub_status"].startswith("APPROVED"):
+                        full = db.xero_get_draft(a["invoice_id"])
+                        if full and full.get("branded_pdf"):
+                            st.download_button(
+                                "Fee note PDF",
+                                data=full["branded_pdf"],
+                                file_name=full["branded_pdf_filename"],
+                                mime="application/pdf",
+                                key=f"tq_dl_{a['invoice_id']}",
+                                use_container_width=True,
+                            )
 
 
 def team_my_billing(user):

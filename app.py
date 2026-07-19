@@ -497,8 +497,15 @@ def team_xero_drafts(user):
         st.info("Xero isn't connected yet — Ash needs to set this up.")
         return
 
+    scols = st.columns([2, 3, 5])
+    force = scols[0].button("Sync now", use_container_width=True,
+                            help="Pull the latest drafts from Xero immediately")
     with st.spinner("Checking Xero for new drafts..."):
-        xero_sync.maybe_sync()
+        xero_sync.maybe_sync(force=force)
+    with scols[1]:
+        last = db.xero_last_sync_time()
+        if last:
+            st.caption(f"Last successful sync: {format_timestamp(last)}")
 
     raisers_reg = db.xero_raisers_all(active_only=True)
     raiser_names = {r["initials"]: r["name"] for r in raisers_reg}

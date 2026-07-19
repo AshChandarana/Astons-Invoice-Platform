@@ -132,42 +132,10 @@ st.markdown(
 
 
 # === BOOT ===
+# Background work (sync, watchdog, nightly backup) runs in worker.py,
+# launched alongside Streamlit by the container start command — it does
+# not depend on anyone opening the app in a browser.
 db.init_db()
-
-
-@st.cache_resource
-def start_background_worker():
-    """Always-on worker inside the app container: syncs Xero, runs the
-    watchdog and takes the nightly backup even when nobody has the Hub
-    open in a browser. Each part throttles itself in the DB, so the
-    5-minute tick is cheap. cache_resource guarantees one thread per
-    container regardless of how many sessions run app.py."""
-    import threading
-    import time as _time
-    import xero_backup
-
-    def loop():
-        while True:
-            try:
-                xero_sync.maybe_sync()
-            except Exception:
-                pass  # sync logs its own failures
-            try:
-                xero_watchdog.maybe_run()
-            except Exception:
-                pass
-            try:
-                xero_backup.maybe_backup()
-            except Exception:
-                pass
-            _time.sleep(300)
-
-    thread = threading.Thread(target=loop, daemon=True, name="hub-worker")
-    thread.start()
-    return thread
-
-
-start_background_worker()
 
 
 # === HELPERS ===

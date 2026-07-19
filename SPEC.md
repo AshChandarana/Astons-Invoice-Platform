@@ -52,7 +52,7 @@ No manual entry point into the Hub. Everything arrives automatically via the Xer
 
 ## 2. Xero API integration
 
-**App scopes:** `accounting.transactions`, `accounting.attachments`, `accounting.contacts.read`, `offline_access`. OAuth 2.0 with refresh token; store tenant ID for the org (and second tenant if AA and CW are separate Xero orgs — see §5).
+**App scopes:** `accounting.invoices`, `accounting.attachments`, `accounting.contacts.read`, `offline_access`. OAuth 2.0 with refresh token; store tenant ID for the org (and second tenant if AA and CW are separate Xero orgs — see §5). *(Note: originally specced as the broad `accounting.transactions` scope; the Xero app "Invoicing Link - To BM/Claude" was created after 2 March 2026 so only Xero's new granular scopes are available — `accounting.invoices` is the granular replacement covering everything the Hub does.)*
 
 ### 2.1 Draft ingestion (poll)
 - `GET /Invoices?Statuses=DRAFT,SUBMITTED&where=Type=="ACCREC"` every 10–15 minutes (use `If-Modified-Since` to fetch deltas only).

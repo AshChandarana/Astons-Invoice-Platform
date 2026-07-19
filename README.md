@@ -10,7 +10,7 @@ Phase 1 polls Xero for BrightManager-raised ACCREC drafts and shows them in a re
 
 Setup (in addition to the variables below):
 
-1. Create a Xero app at developer.xero.com (auth code flow) with redirect URI set to the app's exact URL, and scopes `accounting.transactions`, `accounting.attachments`, `accounting.contacts.read`, `offline_access`.
+1. Create a Xero app at developer.xero.com (auth code flow) with redirect URI set to the app's exact URL, and scopes `accounting.invoices`, `accounting.attachments`, `accounting.contacts.read`, `offline_access` (granular scopes — apps created after 2 Mar 2026 can't use the broad `accounting.transactions`).
 2. Set env vars: `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`, `XERO_REDIRECT_URI` (must match the registered redirect URI exactly).
 3. Log in as approver → **Xero settings** tab → Connect to Xero → authorise the org(s).
 4. Tag each connected org as AA or CW in the same tab.

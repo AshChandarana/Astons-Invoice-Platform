@@ -34,8 +34,10 @@ TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
 API_BASE = "https://api.xero.com/api.xro/2.0"
 
-# Scopes per SPEC.md section 2
-SCOPES = "offline_access accounting.transactions accounting.attachments accounting.contacts.read"
+# Scopes per SPEC.md section 2. The Xero app was created after 2 March
+# 2026, so it only has the new granular scopes: accounting.invoices is
+# the granular replacement for the broad accounting.transactions.
+SCOPES = "offline_access accounting.invoices accounting.attachments accounting.contacts.read"
 
 MAX_429_RETRIES = 4
 

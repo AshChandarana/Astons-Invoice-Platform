@@ -32,6 +32,7 @@ import xero_client
 import xero_sync
 import xero_actions
 import xero_pdf
+import xero_watchdog
 
 UK_TZ = ZoneInfo("Europe/London")
 from generate_invoice import (
@@ -174,7 +175,14 @@ def sidebar_counts(user):
             st.divider()
             st.subheader("Xero")
             st.metric("Drafts awaiting review", xc.get("PENDING_REVIEW", 0))
-            exceptions = xc.get("EXTERNAL_ACTION", 0)
+            report = xero_watchdog.overdue_report()
+            overdue = len(report["warn"]) + len(report["escalate"])
+            if overdue:
+                st.metric("Waiting 3+ days", overdue,
+                          delta=f"{len(report['escalate'])} escalated" if report["escalate"] else None,
+                          delta_color="inverse")
+            exceptions = (xc.get("EXTERNAL_ACTION", 0)
+                          + xc.get("APPROVED_NO_ATTACHMENT", 0))
             if exceptions:
                 st.metric("Exceptions", exceptions)
         st.divider()
@@ -775,6 +783,7 @@ def approver_xero_queue(user):
         force = st.button("Sync now", use_container_width=True)
     with st.spinner("Checking Xero for new drafts..."):
         results = xero_sync.maybe_sync(force=force)
+    xero_watchdog.maybe_run()
     failures = [r for r in results if not r.get("ok")]
     for f in failures:
         st.error(f"Sync failed for tenant {f['tenant_id']}: {f['error']}")
@@ -800,6 +809,11 @@ def approver_xero_queue(user):
                     f"{d['invoice_number'] or '(no number)'}  |  "
                     f"Xero status: {d['xero_status']}"
                 )
+                age = xero_watchdog.draft_age_days(d)
+                if age >= xero_watchdog.ESCALATE_DAYS:
+                    st.error(f"Escalated — waiting {age} days", icon="🚨")
+                elif age >= xero_watchdog.WARN_DAYS:
+                    st.warning(f"Waiting {age} days", icon="⚠️")
             with top[1]:
                 st.write(fmt_money(d["total"]))
                 st.caption(
@@ -974,6 +988,27 @@ def approver_xero_exceptions(user):
         "Xero) and failed sync attempts. Nothing vanishes silently."
     )
 
+    report = xero_watchdog.overdue_report()
+    overdue = report["escalate"] + report["warn"]
+    if overdue:
+        st.write(f"**{len(overdue)}** draft{'s' if len(overdue) != 1 else ''} "
+                 f"waiting {xero_watchdog.WARN_DAYS}+ days for a decision")
+        for d in overdue:
+            with st.container(border=True):
+                cols = st.columns([3, 2, 4])
+                with cols[0]:
+                    st.write(f"**{d['contact_name'] or '(no contact)'}**")
+                    st.caption(d["invoice_number"] or "")
+                with cols[1]:
+                    st.write(fmt_money(d["total"]))
+                with cols[2]:
+                    if d["age_days"] >= xero_watchdog.ESCALATE_DAYS:
+                        st.error(f"Escalated — waiting {d['age_days']} days. "
+                                 "Approve or reject it in the Xero queue.", icon="🚨")
+                    else:
+                        st.warning(f"Waiting {d['age_days']} days.", icon="⚠️")
+        st.divider()
+
     no_attach = db.xero_list_drafts("APPROVED_NO_ATTACHMENT")
     if no_attach:
         st.write(f"**{len(no_attach)}** authorised without attachment — retry needed")
@@ -1143,6 +1178,42 @@ def approver_xero_settings(user):
                     st.rerun()
         if not tracking_seen and not accounts_seen:
             st.info("No tracking options or nominal codes seen in synced drafts yet.")
+
+        st.divider()
+        st.write("**Watchdog & alerts**")
+        st.caption(
+            f"Daily sweep: drafts undecided after {xero_watchdog.WARN_DAYS} days "
+            f"are emailed to {xero_watchdog.alert_recipient()}; "
+            f"{xero_watchdog.ESCALATE_DAYS}+ days is an escalation. "
+            "Weekly digest goes out on Mondays. Sweeps run automatically "
+            "whenever an approver has the Hub open."
+        )
+        if xero_watchdog.email_configured():
+            status = db.xero_kv_get("watchdog_email_status") or "not sent yet"
+            if status == "ok":
+                st.success("Alert email is configured and the last send succeeded.")
+            else:
+                st.warning(f"Alert email status: {status}")
+        else:
+            st.warning(
+                "Alert emails are NOT configured — flags show in the Hub only. "
+                "Add MS_CLIENT_ID, MS_CLIENT_SECRET, MS_TENANT_ID and "
+                "MS_SENDER_EMAIL to Railway (same values as the client "
+                "onboarding app) to enable them."
+            )
+        wcols = st.columns([3, 3, 4])
+        if wcols[0].button("Run sweep + send test digest now", use_container_width=True):
+            xero_watchdog.run_daily_sweep(force=True)
+            result = xero_watchdog.run_weekly_digest(force=True)
+            if result.get("emailed"):
+                st.success("Sweep ran and the digest email was sent.")
+            else:
+                st.warning("Sweep ran; email not sent (not configured or failed — "
+                           "see status above / Exceptions).")
+        digest = db.xero_kv_get("watchdog_last_digest_html")
+        if digest:
+            with st.expander("Latest digest (as emailed)"):
+                st.markdown(digest, unsafe_allow_html=True)
     else:
         st.info("Xero is not connected yet.")
         st.link_button("Connect to Xero", xero_client.build_consent_url())

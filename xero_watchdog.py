@@ -128,7 +128,7 @@ def notify_prepped(draft: dict, prepped_by: str) -> bool:
     )
     return send_email(
         f"Fee note {draft.get('invoice_number') or ''} ready for approval "
-        f"({html.escape(draft.get('contact_name') or '')})",
+        f"({draft.get('contact_name') or ''})",  # subjects are plain text
         body,
     )
 

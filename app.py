@@ -1877,6 +1877,51 @@ def approver_xero_settings(user):
             st.info("No tracking options or nominal codes seen in synced drafts yet.")
 
         st.divider()
+        st.write("**Team setup health check**")
+        st.caption(
+            "Confirms every account is wired the same way: login → "
+            "initials → raiser registry → email for notifications."
+        )
+        users_all = [u for u in db.list_users() if u["active"]]
+        raisers_all = db.xero_raisers_all()
+        active_raisers = {r["initials"]: r for r in raisers_all if r["active"]}
+        user_initials = set()
+        problems = []
+        for u in users_all:
+            initials = (u.get("initials") or "").strip().upper()
+            if not initials:
+                problems.append(
+                    f"⛔ **{u['full_name']}** (@{u['username']}) has no raiser "
+                    "initials — 'raised by' can't default to them (set it in "
+                    "the Users tab).")
+                continue
+            user_initials.add(initials)
+            if initials not in active_raisers:
+                problems.append(
+                    f"⛔ **{u['full_name']}**'s initials **{initials}** aren't "
+                    "an active raiser — re-save their initials in the Users "
+                    "tab to fix.")
+            elif not active_raisers[initials].get("email"):
+                problems.append(
+                    f"🟠 **{u['full_name']}** ({initials}) has no email in the "
+                    "raiser registry — they won't get approve/reject emails.")
+        for r in active_raisers.values():
+            if not r.get("email") and r["initials"] not in user_initials:
+                problems.append(
+                    f"🟠 Raiser **{r['initials']}** ({r['name']}) has no email — "
+                    "no approve/reject notifications for their fee notes.")
+            if r["initials"] not in user_initials:
+                problems.append(
+                    f"ℹ️ Raiser **{r['initials']}** ({r['name']}) has no Hub "
+                    "login linked — fine if they only appear on shared credits.")
+        if problems:
+            for p in problems:
+                st.markdown(p)
+        else:
+            st.success("All consistent: every login has initials, every "
+                       "raiser is registered with an email.")
+
+        st.divider()
         st.write("**Raisers**")
         st.caption(
             "The initials the team puts in the invoice Reference when "

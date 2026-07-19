@@ -217,14 +217,16 @@ def reject_draft(invoice_id: str, user_id: int, reason: str) -> dict:
     )
     db.xero_mark_rejected(invoice_id, user_id, reason.strip())
 
-    # Notify the raiser if the reference identifies one with an email
-    # (SPEC 2.3). Best-effort: a send failure never undoes the reject —
-    # it logs to the sync log and surfaces in Exceptions.
+    # Notify the raiser (SPEC 2.3). The team sets "raised by" at prep,
+    # so the stored raiser_pair is the source of truth; parsing the
+    # reference is only the fallback for unprepped drafts. Best-effort:
+    # a send failure never undoes the reject.
     import html as html_mod
     import xero_attrib
     import xero_watchdog
     notified = []
-    raisers = xero_attrib.parse_reference(draft.get("reference"))
+    raisers = ([i for i in (draft.get("raiser_pair") or "").split("/") if i]
+               or xero_attrib.parse_reference(draft.get("reference")))
     emails = xero_attrib.raiser_emails(raisers)
     if emails:
         body = (

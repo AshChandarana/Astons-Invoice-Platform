@@ -219,6 +219,25 @@ def fmt_money(value) -> str:
         return f"£{value}"
 
 
+def sidebar_change_password(user):
+    with st.expander("Change my password"):
+        current = st.text_input("Current password", type="password", key="cpw_cur")
+        new1 = st.text_input("New password (8+ characters)", type="password",
+                             key="cpw_new1")
+        new2 = st.text_input("Confirm new password", type="password", key="cpw_new2")
+        if st.button("Update password", use_container_width=True):
+            row = db.get_user_by_username(user["username"])
+            if not row or not db.verify_password(current, row["password_hash"]):
+                st.error("Current password is wrong.")
+            elif len(new1) < 8:
+                st.error("New password must be at least 8 characters.")
+            elif new1 != new2:
+                st.error("New passwords don't match.")
+            else:
+                db.reset_user_password(user["id"], new1)
+                st.success("Password changed — use it next time you sign in.")
+
+
 def sidebar_counts(user):
     with st.sidebar:
         sidebar_logo()
@@ -239,6 +258,7 @@ def sidebar_counts(user):
                 if exceptions:
                     st.metric("Exceptions", exceptions)
         st.divider()
+        sidebar_change_password(user)
         st.caption(
             "All data on this platform stays inside Astons. "
             "Invoices are processed on our private Railway deployment."

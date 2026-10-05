@@ -19,6 +19,7 @@ Runs two ways:
 
 import datetime as dt
 import json
+import re
 from email.utils import format_datetime
 
 import db
@@ -65,6 +66,8 @@ def _fetch_paged(tenant_id: str, params: dict, if_modified_since=None):
         if not invoices:
             return
         for inv in invoices:
+            if is_fee_protection(inv):
+                continue          # FPS Hub owns the Fee Protection fee notes
             yield inv
         if len(invoices) < PAGE_SIZE:
             return
@@ -230,6 +233,17 @@ def _notify_new_drafts(results: list) -> None:
     except Exception as exc:
         db.xero_log_sync(None, ok=False, fetched=0,
                          message=f"New-draft notification failed: {exc}"[:500])
+
+
+_FPS_NUMBER = re.compile(r"^\d{4}C?([-.]\d{1,4})?$")   # 1100, 1100C, 9000, 7040-2025, 7043.1
+
+
+def is_fee_protection(inv: dict) -> bool:
+    """Fee Protection Service fee notes are raised and chased by FPS Hub;
+    this app must never show, approve or chase them."""
+    ref = (inv.get("Reference") or "").strip().upper()
+    num = (inv.get("InvoiceNumber") or "").strip().upper()
+    return ref.startswith("FPS-") or bool(_FPS_NUMBER.match(num))
 
 
 def maybe_sync(force: bool = False) -> list:

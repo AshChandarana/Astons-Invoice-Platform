@@ -22,6 +22,7 @@ import datetime as dt
 import hashlib
 import hmac
 import os
+import json
 import time
 from urllib.parse import urlencode
 
@@ -51,7 +52,138 @@ class XeroAuthError(Exception):
 
 
 class XeroApiError(Exception):
-    """Non-auth API failure (bad response, retries exhausted)."""
+    """Non-auth API failure (bad response, retries exhausted). status_code
+    carries the HTTP status when there was one (404 = does not exist)."""
+
+    def __init__(self, message: str, status_code: int = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+calls_made = 0      # accounting-API calls since process start (for cost checks)
+
+
+class XeroRateLimited(XeroApiError):
+    """Xero answered 429. daily=True means this app's daily call allowance
+    for the org is used up — nothing to do but wait for it to free up;
+    daily=False is the per-minute limit, which passes within a minute."""
+
+    def __init__(self, message: str, daily: bool = False, retry_after: int = 0):
+        super().__init__(message)
+        self.daily = daily
+        self.retry_after = retry_after
+
+
+DAILY_LIMIT_TEXT = (
+    "Xero's daily call allowance for the Invoice Hub is used up, so Xero is "
+    "refusing calls until it frees up again (usually early evening)."
+)
+DAILY_RETRY_FLOOR = 3600              # assume an hour when Xero sends no Retry-After
+MAX_MINUTE_WAIT = 90                  # total seconds we will sleep on minute limits
+LIMITS_KEY = "xero_limits"            # latest X-DayLimit/X-MinLimit-Remaining seen
+RATE_LIMIT_KEY = "xero_rate_limit"    # per-tenant: the last daily 429 + Retry-After
+
+
+def _retry_after(resp) -> int:
+    try:
+        return int(resp.headers.get("Retry-After", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_daily_limit(resp) -> bool:
+    """Xero names the limit hit in X-Rate-Limit-Problem ('minute', 'daily'
+    — some docs say 'day' — 'app' = app-wide per-minute, 'concurrent').
+    Only the daily one is worth waiting hours for; a Retry-After beyond
+    five minutes can only be that one too."""
+    problem = (resp.headers.get("X-Rate-Limit-Problem") or "").strip().lower()
+    return problem.startswith("da") or _retry_after(resp) > 300
+
+
+def _rate_limit_key(tenant_id: str) -> str:
+    return f"{RATE_LIMIT_KEY}:{tenant_id}"
+
+
+def _note_limits(resp) -> None:
+    """Xero reports the allowance left on every reply; keep the latest so
+    the settings tab can show how much room there is."""
+    try:
+        day = resp.headers.get("X-DayLimit-Remaining")
+        minute = resp.headers.get("X-MinLimit-Remaining")
+        if day is None and minute is None:
+            return
+        db.xero_kv_set(LIMITS_KEY, json.dumps({
+            "day_remaining": int(day) if day is not None else None,
+            "min_remaining": int(minute) if minute is not None else None,
+            "at": dt.datetime.utcnow().isoformat(),
+        }))
+    except Exception:
+        pass
+
+
+def _note_rate_limit(tenant_id: str, resp) -> None:
+    """Record a DAILY lock-out for this org (minute limits pass by themselves).
+    When Xero gives no Retry-After we assume an hour, but never push an
+    existing pause later just because someone pressed 'Sync now' again."""
+    if not _is_daily_limit(resp):
+        return
+    try:
+        now = dt.datetime.utcnow()
+        retry_after = _retry_after(resp)
+        if not retry_after:
+            current = rate_limit_status(tenant_id)
+            if current:
+                return                     # keep the pause we already have
+            retry_after = DAILY_RETRY_FLOOR
+        db.xero_kv_set(_rate_limit_key(tenant_id), json.dumps({
+            "problem": (resp.headers.get("X-Rate-Limit-Problem") or "").strip().lower(),
+            "daily": True,
+            "retry_after": retry_after,
+            "at": now.isoformat(),
+        }))
+    except Exception:
+        pass
+
+
+def _clear_rate_limit(tenant_id: str) -> None:
+    """A successful call proves the lock-out is over (Xero's Retry-After is
+    an upper bound), so the banner and the auto-sync pause go away."""
+    try:
+        db.xero_kv_delete(_rate_limit_key(tenant_id))
+    except Exception:
+        pass
+
+
+def rate_limit_status(tenant_id: str = None):
+    """The current daily lock-out for a tenant (or, with no tenant, for any
+    connected tenant) as {'tenant_id', 'until': iso, 'retry_after', 'at'};
+    None once Xero's Retry-After has passed or nothing was recorded."""
+    tenants = ([tenant_id] if tenant_id
+               else [c["tenant_id"] for c in db.xero_list_connections()])
+    for tid in tenants:
+        raw = db.xero_kv_get(_rate_limit_key(tid))
+        if not raw:
+            continue
+        try:
+            info = json.loads(raw)
+            at = dt.datetime.fromisoformat(info["at"])
+            until = at + dt.timedelta(seconds=int(info.get("retry_after") or 0))
+        except (ValueError, TypeError, KeyError):
+            continue
+        if dt.datetime.utcnow() >= until:
+            continue
+        return {"tenant_id": tid, "until": until.isoformat(),
+                "retry_after": info.get("retry_after"), "at": info["at"]}
+    return None
+
+
+def limits() -> dict:
+    """Latest allowance figures seen, or {} before the first call."""
+    raw = db.xero_kv_get(LIMITS_KEY)
+    try:
+        return json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
 
 
 # === CONFIG ===
@@ -229,9 +361,12 @@ def _request(method: str, tenant_id: str, path: str, *, params: dict = None,
              content_type: str = None, if_modified_since: str = None) -> dict:
     """One accounting-API call for one tenant, with 429 back-off and one
     automatic re-auth attempt on 401. 304 Not Modified returns {}."""
+    global calls_made
     url = f"{API_BASE}/{path.lstrip('/')}"
     attempts_401 = 0
+    waited = 0
     for attempt in range(MAX_429_RETRIES + 1):
+        calls_made += 1
         headers = {
             "Authorization": f"Bearer {get_access_token()}",
             "Xero-tenant-id": tenant_id,
@@ -246,6 +381,9 @@ def _request(method: str, tenant_id: str, path: str, *, params: dict = None,
             json=json_payload, data=data, timeout=60,
         )
 
+        _note_limits(resp)
+        if resp.status_code in (200, 201, 304):
+            _clear_rate_limit(tenant_id)
         if resp.status_code in (200, 201):
             return resp.json()
         if resp.status_code == 304:
@@ -255,13 +393,27 @@ def _request(method: str, tenant_id: str, path: str, *, params: dict = None,
             _refresh_tokens()
             continue
         if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", "5"))
-            time.sleep(min(wait, 60))
+            _note_rate_limit(tenant_id, resp)
+            if _is_daily_limit(resp):
+                # Waiting a minute cannot help: fail fast with a plain message
+                # instead of hanging the page for five minutes.
+                raise XeroRateLimited(DAILY_LIMIT_TEXT, daily=True,
+                                      retry_after=_retry_after(resp) or DAILY_RETRY_FLOOR)
+            wait = min(_retry_after(resp) or 5, 60)
+            if waited + wait > MAX_MINUTE_WAIT:
+                break                      # don't hang the page; say so instead
+            time.sleep(wait)
+            waited += wait
             continue
         raise XeroApiError(
-            f"{method} {path} failed ({resp.status_code}): {resp.text[:300]}"
+            f"{method} {path} failed ({resp.status_code}): {resp.text[:300]}",
+            status_code=resp.status_code,
         )
-    raise XeroApiError(f"{method} {path}: rate-limit retries exhausted (429).")
+    raise XeroRateLimited(
+        f"{method} {path}: Xero is rate-limiting the Hub (too many calls this "
+        "minute). It clears within a minute — try again shortly.",
+        daily=False,
+    )
 
 
 def api_get(tenant_id: str, path: str, params: dict = None,

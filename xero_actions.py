@@ -53,6 +53,8 @@ def fetch_contact(tenant_id: str, contact_id: str) -> dict:
         cdata = xero_client.api_get(tenant_id, f"Contacts/{contact_id}")
         contacts = (cdata or {}).get("Contacts", [])
         return contacts[0] if contacts else {}
+    except xero_client.XeroRateLimited:
+        raise                      # no point going on to the Xero write
     except xero_client.XeroApiError:
         return {}
 
@@ -145,30 +147,102 @@ def approve_draft(invoice_id: str, user_id: int, entity: str,
 
     # Tell the raiser(s) their fee note went through. Best-effort — a
     # send failure never affects the approval itself.
-    import html as html_mod
-    import xero_watchdog
     notified = []
     emails = xero_attrib.raiser_emails(raisers)
-    if emails:
-        body = (
-            f"<p>Your fee note <b>{html_mod.escape(draft['invoice_number'] or '')}</b> "
-            f"for <b>{html_mod.escape(draft['contact_name'] or '')}</b> "
-            f"({'£' + format(draft['total'] or 0, ',.2f')}) has been approved.</p>"
-            f"<p>The branded fee note is attached — send it on to the "
-            f"client. It is also on the invoice in Xero (and the client's "
-            f"online invoice link).</p>"
-        )
-        if xero_watchdog.send_email(
-            f"Fee note {draft['invoice_number']} approved — ready to send",
-            body, to=emails,
-            attachments=[{"name": filename, "bytes": pdf_bytes}],
-        ):
-            notified = emails
+    if emails and send_approval_email(draft, filename, pdf_bytes, emails):
+        notified = emails
+    # 'none' = an email was due but failed (resend candidate);
+    # 'no-email' = nobody to tell (raiser has no address on file).
+    outcome = ",".join(notified) or ("none" if emails else "no-email")
     db.record_xero_event(user_id, "xero_approve_notify",
-                         f"xero_invoice_id={invoice_id} "
-                         f"notified={','.join(notified) or 'none'}")
+                         f"xero_invoice_id={invoice_id} notified={outcome}")
     return {"attachment_ok": attachment_ok, "error": error,
-            "invoice_number": draft["invoice_number"], "notified": notified}
+            "invoice_number": draft["invoice_number"], "notified": notified,
+            "emails_expected": bool(emails)}
+
+
+def send_approval_email(draft: dict, filename: str, pdf_bytes: bytes,
+                        emails: list, resend: bool = False) -> bool:
+    """The 'fee note approved' email to the raiser(s), branded PDF attached.
+    Used at approval time and by resend_approval_emails after an outage."""
+    import html as html_mod
+    import xero_watchdog
+    number = draft.get("invoice_number") or ""
+    body = (
+        f"<p>Your fee note <b>{html_mod.escape(number)}</b> "
+        f"for <b>{html_mod.escape(draft.get('contact_name') or '')}</b> "
+        f"({'£' + format(draft.get('total') or 0, ',.2f')}) has been approved.</p>"
+        f"<p>The branded fee note is attached — send it on to the "
+        f"client. It is also on the invoice in Xero (and the client's "
+        f"online invoice link).</p>"
+    )
+    if resend:
+        body = ("<p><i>Re-sent: this notification could not be delivered when the "
+                "fee note was approved.</i></p>" + body)
+    return xero_watchdog.send_email(
+        f"Fee note {number} approved — ready to send",
+        body, to=emails,
+        attachments=[{"name": filename, "bytes": pdf_bytes}],
+    )
+
+
+def unnotified_approvals(since_iso: str) -> list:
+    """Fee notes approved since `since_iso` whose raisers never got the
+    approval email (used to preview a resend): each with 'emails' and
+    'can_send' (has raiser email AND a stored PDF)."""
+    import xero_attrib
+    out = []
+    for d in db.xero_unnotified_approvals_since(since_iso, with_pdf=False):
+        raisers = [r for r in (d.get("raiser_pair") or "").split("/") if r]
+        d["emails"] = xero_attrib.raiser_emails(raisers)
+        d["can_send"] = bool(d["emails"] and d.get("has_pdf"))
+        out.append(d)
+    return out
+
+
+def resend_approval_emails(since_iso: str, user_id: int) -> dict:
+    """Re-send the approval email (with the stored branded PDF) for every fee
+    note approved on or after `since_iso` whose raisers were NOT emailed
+    (per the audit trail) — for after an email outage. Never emails anyone
+    twice: a successful resend is recorded as a notify event. Stops at the
+    first failed send (the outage is probably still on) and reports what was
+    sent, skipped (no raiser email / no stored PDF) and not attempted."""
+    import xero_attrib
+    sent, skipped, failed, not_attempted = [], [], [], []
+    rows = db.xero_unnotified_approvals_since(since_iso)
+    pending = list(rows)
+    while pending:
+        d = pending.pop(0)
+        label = d["invoice_number"] or d["invoice_id"]
+        raisers = [r for r in (d.get("raiser_pair") or "").split("/") if r]
+        emails = xero_attrib.raiser_emails(raisers)
+        if not emails or not d.get("branded_pdf"):
+            skipped.append(label)
+            if not emails:
+                # Nobody to tell: record it so the preview stops listing it.
+                # (A missing PDF is left open — a later attachment retry
+                # stores one, and the raiser should then get the email.)
+                db.record_xero_event(user_id, "xero_resend_notify",
+                                     f"xero_invoice_id={d['invoice_id']} notified=no-email")
+            continue
+        ok = send_approval_email(d, d.get("branded_pdf_filename")
+                                 or f"FeeNote_{d['invoice_number']}.pdf",
+                                 d["branded_pdf"], emails, resend=True)
+        if ok:
+            sent.append(label)
+            db.record_xero_event(user_id, "xero_resend_notify",
+                                 f"xero_invoice_id={d['invoice_id']} "
+                                 f"notified={','.join(emails)}")
+        else:
+            failed.append(label)
+            not_attempted = [r["invoice_number"] or r["invoice_id"] for r in pending]
+            break
+    db.record_xero_event(
+        user_id, "xero_resend_approval_emails",
+        f"since={since_iso} sent={len(sent)} failed={len(failed)} "
+        f"skipped={len(skipped)} not_attempted={len(not_attempted)}")
+    return {"sent": sent, "skipped": skipped, "failed": failed,
+            "not_attempted": not_attempted, "considered": len(rows)}
 
 
 def retry_attachment(invoice_id: str, user_id: int) -> dict:
@@ -244,7 +318,8 @@ def reject_draft(invoice_id: str, user_id: int, reason: str) -> dict:
             body, to=emails,
         ):
             notified = emails
+    outcome = ",".join(notified) or ("none" if emails else "no-email")
     db.record_xero_event(user_id, "xero_reject_notify",
-                         f"xero_invoice_id={invoice_id} "
-                         f"notified={','.join(notified) or 'none'}")
-    return {"invoice_number": draft["invoice_number"], "notified": notified}
+                         f"xero_invoice_id={invoice_id} notified={outcome}")
+    return {"invoice_number": draft["invoice_number"], "notified": notified,
+            "emails_expected": bool(emails)}

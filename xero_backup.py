@@ -28,6 +28,7 @@ SP_HOST = os.environ.get("SP_HOSTNAME", "astonsaccountants.sharepoint.com")
 SP_SITE_PATH = os.environ.get("SP_BACKUP_SITE_PATH", "/sites/Aston-FirmOperations")
 SP_FOLDER = os.environ.get("SP_BACKUP_FOLDER", "InvoiceHub Backups")
 BACKUP_AFTER_HOUR = 2  # first tick after 02:00 UK
+BACKUP_RETRY_MINUTES = 60   # after a failure, try again hourly, not every tick
 CHUNK = 5 * 1024 * 1024
 
 
@@ -109,8 +110,17 @@ def maybe_backup() -> None:
     today = now.date().isoformat()
     if db.xero_kv_get("backup_last_date") == today:
         return
+    last_failed = db.xero_kv_get("backup_last_failed_at")
+    if last_failed:
+        try:
+            since_fail = dt.datetime.utcnow() - dt.datetime.fromisoformat(last_failed)
+            if since_fail < dt.timedelta(minutes=BACKUP_RETRY_MINUTES):
+                return          # e.g. Microsoft sign-in down: don't hammer it
+        except ValueError:
+            pass
     try:
         result = run_backup()
+        db.xero_kv_delete("backup_last_failed_at")
         db.xero_kv_set("backup_last_date", today)
         db.xero_kv_set(
             "backup_status",
@@ -119,6 +129,10 @@ def maybe_backup() -> None:
         )
         db.record_xero_event(None, "db_backup", result["filename"])
     except Exception as exc:
+        db.xero_kv_set("backup_last_failed_at", dt.datetime.utcnow().isoformat())
         db.xero_kv_set("backup_status", f"FAILED {now.strftime('%d %b %H:%M')}: {exc}"[:300])
-        db.xero_log_sync(None, ok=False, fetched=0,
-                         message=f"SharePoint backup failed: {exc}"[:500])
+        # Exceptions tab: one line per day (the status above updates hourly).
+        if db.xero_kv_get("backup_fail_logged_date") != today:
+            db.xero_kv_set("backup_fail_logged_date", today)
+            db.xero_log_sync(None, ok=False, fetched=0,
+                             message=f"SharePoint backup failed: {exc}"[:500])

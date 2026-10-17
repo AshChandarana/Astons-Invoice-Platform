@@ -18,6 +18,7 @@ import re
 import tempfile
 import traceback
 import zipfile
+import datetime as dt
 from datetime import datetime
 from pathlib import Path
 
@@ -207,6 +208,74 @@ def header(user):
             auth.logout()
             st.rerun()
     st.divider()
+
+
+def system_banners(user: dict):
+    """Warnings everyone sees on every page: Microsoft sign-in refused
+    (emails + backups down), the Microsoft client secret about to expire
+    (approvers only — they hold the fix), and Xero having paused the Hub."""
+    approver = user.get("role") == "approver"
+    ms = xero_watchdog.ms_auth_status()
+    if ms.get("state") == "down":
+        since = format_timestamp(ms.get("since"))
+        if approver:
+            fix = ("Fix: new client secret in Entra, then update MS_CLIENT_SECRET on "
+                   "Railway (Invoice Hub, Launchpad, MyAstons)."
+                   if ms.get("hard") else
+                   "Microsoft is not accepting our sign-in; the Hub re-checks every "
+                   "15 minutes (or use 'Check Microsoft sign-in now' in Xero settings).")
+            st.error(
+                f"Microsoft emails and backups are DOWN since {since}: "
+                f"{ms.get('error') or 'sign-in refused'}. Approvals still work and "
+                "fee notes still attach in Xero, but no notification emails are going "
+                f"out. {fix}",
+                icon="🚨",
+            )
+        else:
+            st.error(
+                f"Email notifications are currently unavailable (since {since}). "
+                "Approvals still go through; download fee notes from 'Find fee note' "
+                "meanwhile.",
+                icon="🚨",
+            )
+    if approver:
+        warn = xero_watchdog.secret_expiry_warning()
+        if warn:
+            (st.error if warn["level"] == "error" else st.warning)(warn["text"], icon="🔑")
+    try:
+        paused = xero_client.rate_limit_status()
+    except Exception:
+        paused = None
+    if paused:
+        st.warning(
+            "Xero has paused the Hub's connection: the daily call allowance is used "
+            "up. Xero usually frees it up in the early evening; the Hub next checks at "
+            f"about {format_timestamp(paused['until'])}. Drafts raised meanwhile appear "
+            "at the first sync after that; approving or rejecting may fail until then.",
+            icon="⏳",
+        )
+
+
+def show_sync_failures(results: list):
+    """Plain-English outcome of a sync: a daily-allowance pause is a
+    warning, a sync already running is information, anything else is an
+    error."""
+    for r in results or []:
+        if r.get("skipped") == "in_progress":
+            st.info("A sync is already running — it finishes within a minute; "
+                    "reload then.", icon="⏳")
+            continue
+        if r.get("skipped") == "paused":
+            continue                        # the page banner already says so
+        if r.get("ok"):
+            continue
+        if r.get("rate_limited") and r.get("daily"):
+            st.warning(f"{r['error']} Nothing is lost: drafts raised meanwhile appear "
+                       "at the first sync after that.", icon="⏳")
+        elif r.get("rate_limited"):
+            st.warning(r["error"], icon="⏳")
+        else:
+            st.error(f"Sync failed: {r['error']}")
 
 
 def fmt_money(value) -> str:
@@ -574,11 +643,13 @@ def team_xero_drafts(user):
     force = scols[0].button("Sync now", use_container_width=True,
                             help="Pull the latest drafts from Xero immediately")
     with st.spinner("Checking Xero for new drafts..."):
-        xero_sync.maybe_sync(force=force)
+        results = xero_sync.maybe_sync(force=force)
+    show_sync_failures(results)
     with scols[1]:
-        last = db.xero_last_sync_time()
+        last, detail = db.xero_last_sync_info()
         if last:
-            st.caption(f"Last successful sync: {format_timestamp(last)}")
+            st.caption(f"Last successful sync: {format_timestamp(last)}"
+                       + (f" ({detail})" if detail else ""))
 
     raisers_reg = db.xero_raisers_all(active_only=True)
     raiser_names = {r["initials"]: r["name"] for r in raisers_reg}
@@ -1139,7 +1210,8 @@ def show_flash(key: str):
     flash = st.session_state.pop(key, None)
     if flash:
         kind, msg = flash
-        {"success": st.success, "error": st.error, "warning": st.warning}[kind](msg)
+        {"success": st.success, "error": st.error, "warning": st.warning,
+         "info": st.info}[kind](msg)
 
 
 def approver_xero_queue(user):
@@ -1170,13 +1242,12 @@ def approver_xero_queue(user):
     with st.spinner("Checking Xero for new drafts..."):
         results = xero_sync.maybe_sync(force=force)
     xero_watchdog.maybe_run()
-    failures = [r for r in results if not r.get("ok")]
-    for f in failures:
-        st.error(f"Sync failed for tenant {f['tenant_id']}: {f['error']}")
+    show_sync_failures(results)
     with cols[1]:
-        last = db.xero_last_sync_time()
+        last, detail = db.xero_last_sync_info()
         if last:
-            st.caption(f"Last successful sync: {format_timestamp(last)}")
+            st.caption(f"Last successful sync: {format_timestamp(last)}"
+                       + (f" ({detail})" if detail else ""))
 
     entity_map = db.xero_entity_map_all()
     raisers_reg = db.xero_raisers_all(active_only=True)
@@ -1370,7 +1441,12 @@ def approver_xero_queue(user):
                                     f"{result['invoice_number']} authorised in Xero "
                                     "and branded fee note attached."
                                     + (f" Raiser notified at {', '.join(notified)}."
-                                       if notified else ""),
+                                       if notified else
+                                       (" Raiser could NOT be emailed — see Microsoft "
+                                        "connection in Xero settings; send them the PDF "
+                                        "from 'Find fee note', or use 'Resend approval "
+                                        "emails' once it is working."
+                                        if result.get("emails_expected") else "")),
                                 )
                             else:
                                 st.session_state["xq_flash"] = (
@@ -1417,8 +1493,12 @@ def approver_xero_queue(user):
                                 f"{result['invoice_number']} deleted in Xero. "
                                 + (f"Raiser notified at {', '.join(notified)}. "
                                    if notified else
-                                   "The raiser should amend and re-raise in "
-                                   "BrightManager (no raiser email on file to notify). ")
+                                   ("The raiser could NOT be emailed (see Microsoft "
+                                    "connection in Xero settings) — tell them to amend "
+                                    "and re-raise in BrightManager. "
+                                    if result.get("emails_expected") else
+                                    "The raiser should amend and re-raise in "
+                                    "BrightManager (no raiser email on file to notify). "))
                                 + BM_TIDY_NOTE,
                             )
                             st.session_state.pop(f"xq_confirm_rej_{iid}", None)
@@ -2073,6 +2153,126 @@ def approver_xero_settings(user):
         if digest:
             with st.expander("Latest digest (as emailed)"):
                 st.markdown(digest, unsafe_allow_html=True)
+
+        st.divider()
+        st.write("**Microsoft connection (emails & backups)**")
+        ms = xero_watchdog.ms_auth_status()
+        if ms.get("state") == "down":
+            st.error(f"Sign-in refused since {format_timestamp(ms.get('since'))}: "
+                     f"{ms.get('error') or ''}")
+        elif ms.get("state") == "flaky":
+            st.warning(f"One Microsoft sign-in failed at {format_timestamp(ms.get('at'))} "
+                       f"({ms.get('error') or ''}); not treated as an outage unless it "
+                       "happens again.")
+        elif ms.get("state") == "ok":
+            st.success(f"Microsoft sign-in working since {format_timestamp(ms.get('since') or ms.get('at'))}.")
+        else:
+            st.caption("No Microsoft call made yet.")
+        show_flash("ms_check_flash")
+        if st.button("Check Microsoft sign-in now", key="ms_check_btn",
+                     help="Asks Microsoft for a token only — sends no email."):
+            with st.spinner("Checking..."):
+                checked = xero_watchdog.check_ms_auth()
+            when = format_timestamp(checked.get("checked_at"))
+            if checked.get("state") == "ok":
+                st.session_state["ms_check_flash"] = (
+                    "success", f"Checked at {when} UK: Microsoft accepted the sign-in.")
+            elif checked.get("state") == "unconfigured":
+                st.session_state["ms_check_flash"] = (
+                    "warning", f"Email is not configured: {checked.get('error')}.")
+            elif checked.get("state") == "flaky":
+                st.session_state["ms_check_flash"] = (
+                    "warning", f"Checked at {when} UK: one sign-in failed "
+                               f"({checked.get('error') or 'unknown error'}); not yet "
+                               "treated as an outage — check again in a minute.")
+            else:
+                st.session_state["ms_check_flash"] = (
+                    "error", f"Checked at {when} UK: still refused — "
+                             f"{checked.get('error') or 'unknown error'}")
+            st.rerun()
+        expiry_raw = os.environ.get("MS_SECRET_EXPIRES", "").strip()
+        warn = xero_watchdog.secret_expiry_warning()
+        if warn:
+            (st.error if warn["level"] == "error" else st.warning)(warn["text"])
+        elif expiry_raw:
+            st.caption(f"Client secret expires {expiry_raw} — a warning will show from "
+                       "30 days before.")
+        else:
+            st.warning("MS_SECRET_EXPIRES is not set on Railway. Set it to the client "
+                       "secret's expiry date from Entra (e.g. 2028-10-16) so everyone "
+                       "gets a 30-day warning instead of a surprise outage.")
+        backup = db.xero_kv_get("backup_status")
+        if backup:
+            (st.error if backup.startswith("FAILED") else st.caption)(f"Nightly backup: {backup}")
+        show_flash("resend_flash")
+        with st.expander("Resend approval emails after an outage"):
+            st.caption(
+                "Re-sends the 'fee note approved' email, with the stored branded "
+                "PDF, to the raisers of fee notes approved since the date below "
+                "whose email did NOT go out (per the audit trail). Nobody is "
+                "emailed twice. Use it once Microsoft sign-in is working again."
+            )
+            default_since = dt.date.today() - dt.timedelta(days=7)
+            outage_start = (ms.get("since") if ms.get("state") in ("down", "flaky")
+                            else ms.get("last_down_since"))
+            try:
+                if outage_start:
+                    default_since = min(default_since,
+                                        dt.datetime.fromisoformat(outage_start).date())
+            except ValueError:
+                pass
+            st.caption("Widen the date if the outage began before the Hub noticed it.")
+            since_date = st.date_input(
+                "Approved on or after",
+                value=default_since,
+                key="resend_since",
+            )
+            since_iso = dt.datetime.combine(since_date, dt.time.min).isoformat()
+            candidates = xero_actions.unnotified_approvals(since_iso)
+            if candidates:
+                st.write(f"**{len(candidates)}** fee note"
+                         f"{'s' if len(candidates) != 1 else ''} awaiting a resend:")
+                for c in candidates:
+                    who = ", ".join(c["emails"]) if c["emails"] else "no raiser email on file"
+                    why = ("" if c["can_send"] else
+                           ("  (will be skipped: no raiser email)" if not c["emails"]
+                            else "  (will be skipped: no stored PDF)"))
+                    st.caption(f"{c['invoice_number']} — {c['contact_name']} → {who}{why}")
+            else:
+                st.caption("Every approval since that date was emailed.")
+            if st.button("Resend approval emails", key="resend_btn",
+                         disabled=not any(c["can_send"] for c in candidates)):
+                with st.spinner("Re-sending..."):
+                    result = xero_actions.resend_approval_emails(since_iso, user["id"])
+                parts = []
+                if result["sent"]:
+                    parts.append(f"Re-sent {len(result['sent'])}: {', '.join(result['sent'])}.")
+                if result["skipped"]:
+                    parts.append("Skipped (no raiser email or no stored PDF): "
+                                 f"{', '.join(result['skipped'])}.")
+                if result["failed"]:
+                    parts.append(f"Failed on {', '.join(result['failed'])} — stopped there; "
+                                 f"{len(result['not_attempted'])} not attempted. Check the "
+                                 "Microsoft connection status above and try again.")
+                level = "error" if result["failed"] else ("success" if result["sent"] else "info")
+                st.session_state["resend_flash"] = (
+                    level, " ".join(parts) or "No approved fee notes found since that date.")
+                st.rerun()
+
+        st.divider()
+        st.write("**Xero call allowance**")
+        lim = xero_client.limits()
+        if lim:
+            def _n(v):
+                return "?" if v is None else v
+            st.caption(
+                f"Calls left today: {_n(lim.get('day_remaining'))}  |  this minute: "
+                f"{_n(lim.get('min_remaining'))}  (as at {format_timestamp(lim.get('at'))}). "
+                "A sync costs about 2 calls plus one per 40 drafts waiting; syncs run "
+                f"every {xero_sync.POLL_INTERVAL_MINUTES} minutes."
+            )
+        else:
+            st.caption("No Xero call recorded yet.")
     else:
         st.info("Xero is not connected yet.")
         st.link_button("Connect to Xero", xero_client.build_consent_url())
@@ -2116,6 +2316,7 @@ def main():
     handle_xero_oauth_callback()
     user = auth.require_login()
     header(user)
+    system_banners(user)
     if user["role"] == "approver":
         render_approver_view(user)
     else:

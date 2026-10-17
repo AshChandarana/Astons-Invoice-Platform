@@ -48,18 +48,180 @@ def alert_recipient() -> str:
     return os.environ.get("WATCHDOG_ALERT_EMAIL", "ash@astonsaccountants.co.uk").strip()
 
 
+MS_AUTH_KEY = "ms_auth_status"
+SECRET_EXPIRED_TEXT = (
+    "Microsoft sign-in refused: the Hub's client secret has expired or is "
+    "invalid. Create a new client secret for the app in Microsoft Entra and "
+    "update MS_CLIENT_SECRET on Railway (Invoice Hub, Launchpad and MyAstons "
+    "share it)."
+)
+
+
+MS_RECHECK_MINUTES = 15
+MS_RECHECK_HARD_MINUTES = 60
+
+
+def _secret_fingerprint() -> str:
+    """Short, non-reversible marker of the configured secret, so a renewed
+    secret is recognised and re-tried at once."""
+    import hashlib
+    return hashlib.sha256(os.environ.get("MS_CLIENT_SECRET", "").encode()).hexdigest()[:8]
+
+
+def _set_ms_auth_status(state: str, error: str = None, hard: bool = False) -> None:
+    """Remember whether Microsoft is accepting our sign-in, so every page
+    can show a banner the moment it stops (and clear it when it recovers).
+    A credential failure (hard=True) is 'down' at once; a transient failure
+    only counts as 'down' on the second consecutive one, so a single blip
+    does not light the banner for everyone. 'since' keeps the time of the
+    FIRST failure of the current outage; the ok record keeps the last
+    outage's start as 'last_down_since' (for the resend default date)."""
+    import json
+    now = dt.datetime.utcnow().isoformat()
+    previous = ms_auth_status()
+    fingerprint = _secret_fingerprint()
+    if state == "down":
+        failures = int(previous.get("failures") or 0) + 1
+        was_down = previous.get("state") == "down"
+        since = previous.get("since") if previous.get("state") in ("down", "flaky") else now
+        new_state = "down" if (hard or was_down or failures >= 2) else "flaky"
+        # A credential problem stays 'hard' for the outage — unless the
+        # secret has since been changed, which is fresh evidence.
+        same_secret = previous.get("secret") in (None, fingerprint)
+        sticky_hard = bool(previous.get("hard")) and same_secret
+        db.xero_kv_set(MS_AUTH_KEY, json.dumps(
+            {"state": new_state, "since": since or now, "at": now,
+             "failures": failures, "hard": bool(hard or sticky_hard),
+             "error": (error or "")[:300], "secret": fingerprint}))
+    else:
+        if previous.get("state") == "ok" and previous.get("at"):
+            return                       # already fine; skip the write
+        record = {"state": "ok", "at": now, "since": now}
+        last_down = previous.get("since") if previous.get("state") in ("down", "flaky") else None
+        last_down = last_down or previous.get("last_down_since")
+        if last_down:
+            record["last_down_since"] = last_down
+        db.xero_kv_set(MS_AUTH_KEY, json.dumps(record))
+        # Recovery: let the nightly backup retry at the next tick rather
+        # than waiting out its hourly gate.
+        db.xero_kv_delete("backup_last_failed_at")
+
+
+def check_ms_auth() -> dict:
+    """Ask Microsoft for a token (no email) and record the outcome. Returns
+    the new status dict (with 'checked_at'). Safe to call from a button or
+    the worker."""
+    if not email_configured():
+        return {"state": "unconfigured",
+                "error": "MS_CLIENT_ID / MS_CLIENT_SECRET / MS_TENANT_ID / "
+                         "MS_SENDER_EMAIL are not all set"}
+    try:
+        _graph_token()
+    except Exception:
+        pass                             # _graph_token already recorded it
+    status = ms_auth_status()
+    status["checked_at"] = dt.datetime.utcnow().isoformat()
+    return status
+
+
+def maybe_recheck_ms_auth() -> bool:
+    """Worker tick: while Microsoft is marked down/flaky, re-probe when the
+    secret has been changed (new fingerprint) or every MS_RECHECK_MINUTES,
+    so the banner clears itself soon after a renewal. Returns True if a
+    probe was made."""
+    status = ms_auth_status()
+    if status.get("state") not in ("down", "flaky") or not email_configured():
+        return False
+    changed = status.get("secret") and status["secret"] != _secret_fingerprint()
+    try:
+        age = dt.datetime.utcnow() - dt.datetime.fromisoformat(status.get("at") or "")
+    except ValueError:
+        age = dt.timedelta(days=1)
+    # A credential failure cannot fix itself without a new secret, so probe
+    # only hourly in case it was fixed in Entra some other way; anything
+    # else is re-tried every MS_RECHECK_MINUTES.
+    wait = dt.timedelta(minutes=MS_RECHECK_HARD_MINUTES if status.get("hard")
+                        else MS_RECHECK_MINUTES)
+    if not changed and age < wait:
+        return False
+    check_ms_auth()
+    return True
+
+
+def ms_auth_status() -> dict:
+    """{'state': 'ok'|'down', 'since', 'at', 'error'} or {} before any call."""
+    import json
+    raw = db.xero_kv_get(MS_AUTH_KEY)
+    try:
+        return json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+
+
+def secret_expiry_warning(today: dt.date = None) -> dict:
+    """Warning about the Microsoft client secret's expiry, from the
+    MS_SECRET_EXPIRES env var (ISO date, as shown in Entra). Returns
+    {'level': 'warning'|'error', 'days': n, 'text': ...} from 30 days out,
+    else {}."""
+    raw = os.environ.get("MS_SECRET_EXPIRES", "").strip()
+    if not raw:
+        return {}
+    try:
+        expires = dt.date.fromisoformat(raw[:10])
+    except ValueError:
+        return {}
+    today = today or dt.datetime.now(ZoneInfo("Europe/London")).date()
+    days = (expires - today).days
+    when = expires.strftime("%d %b %Y").lstrip("0")
+    fix = ("Create a new client secret for the app in Microsoft Entra and update "
+           "MS_CLIENT_SECRET (and MS_SECRET_EXPIRES) on Railway for the Invoice Hub, "
+           "Launchpad and MyAstons.")
+    if days < 0:
+        return {"level": "error", "days": days,
+                "text": f"The Microsoft client secret expired on {when}. "
+                        f"Emails and backups will fail until it is renewed. {fix}"}
+    if days == 0:
+        return {"level": "error", "days": 0,
+                "text": f"The Microsoft client secret expires TODAY ({when}). {fix}"}
+    if days <= 30:
+        return {"level": "warning", "days": days,
+                "text": f"The Microsoft client secret expires in {days} day"
+                        f"{'s' if days != 1 else ''}, on {when}. {fix}"}
+    return {}
+
+
 def _graph_token() -> str:
-    resp = requests.post(
-        GRAPH_TOKEN_URL.format(tenant=os.environ["MS_TENANT_ID"].strip()),
-        data={
-            "grant_type": "client_credentials",
-            "client_id": os.environ["MS_CLIENT_ID"].strip(),
-            "client_secret": os.environ["MS_CLIENT_SECRET"].strip(),
-            "scope": "https://graph.microsoft.com/.default",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.post(
+            GRAPH_TOKEN_URL.format(tenant=os.environ["MS_TENANT_ID"].strip()),
+            data={
+                "grant_type": "client_credentials",
+                "client_id": os.environ["MS_CLIENT_ID"].strip(),
+                "client_secret": os.environ["MS_CLIENT_SECRET"].strip(),
+                "scope": "https://graph.microsoft.com/.default",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        _set_ms_auth_status("down", f"network: {exc}"[:160])
+        raise RuntimeError(f"Microsoft sign-in unreachable ({exc}).") from exc
+    if resp.status_code != 200:
+        try:
+            err = resp.json()
+        except ValueError:
+            err = {}
+        if not isinstance(err, dict):
+            err = {}
+        code = (err.get("error") or f"HTTP {resp.status_code}").strip()
+        desc = (err.get("error_description") or resp.text or "").strip()
+        short = f"{code}: {desc[:160]}"
+        credential_problem = (code in ("invalid_client", "unauthorized_client")
+                              or "AADSTS7000222" in desc)
+        _set_ms_auth_status("down", short, hard=credential_problem)
+        if credential_problem:
+            raise RuntimeError(SECRET_EXPIRED_TEXT)
+        raise RuntimeError(f"Microsoft sign-in failed ({short}).")
+    _set_ms_auth_status("ok")
     return resp.json()["access_token"]
 
 

@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action       TEXT    NOT NULL,
     note         TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action, id);
 
 -- === XERO INTEGRATION (SPEC.md Phase 1) ===
 
@@ -638,6 +639,26 @@ def xero_kv_delete(key: str) -> None:
         conn.execute("DELETE FROM xero_kv WHERE key = ?", (key,))
 
 
+def xero_kv_acquire(key: str, value: str, stale_before: str) -> bool:
+    """Atomic lock: write `value` under `key` if the key is absent or its
+    current value sorts before `stale_before` (an old, abandoned lock).
+    Returns True if this call now holds the lock."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO xero_kv (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+            "WHERE xero_kv.value < ?",
+            (key, value, stale_before),
+        )
+        return cur.rowcount == 1
+
+
+def xero_kv_release(key: str, value: str) -> None:
+    """Release a lock only if we still hold it (value unchanged)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM xero_kv WHERE key = ? AND value = ?", (key, value))
+
+
 # === XERO: CONNECTIONS ===
 
 def xero_upsert_connection(tenant_id: str, tenant_name: str) -> None:
@@ -791,16 +812,18 @@ def xero_pending_ids_for_tenant(tenant_id: str):
         return [r["invoice_id"] for r in rows]
 
 
-def xero_mark_external_action(invoice_id: str, note: str) -> None:
+def xero_mark_external_action(invoice_id: str, note: str) -> bool:
+    """Flag a still-pending draft; returns False if it was decided meanwhile."""
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE xero_drafts
             SET hub_status = 'EXTERNAL_ACTION', external_action_note = ?
-            WHERE invoice_id = ?
+            WHERE invoice_id = ? AND hub_status = 'PENDING_REVIEW'
             """,
             (note, invoice_id),
         )
+        return cur.rowcount == 1
 
 
 def xero_dismiss_draft(invoice_id: str, user_id: int) -> None:
@@ -878,6 +901,7 @@ def xero_mark_approved(invoice_id: str, user_id: int, entity: str,
             """
             UPDATE xero_drafts
             SET hub_status = ?, entity = ?, decided_by_user_id = ?, decided_at = ?,
+                external_action_note = NULL,
                 action_error = ?, branded_pdf = ?, branded_pdf_filename = ?,
                 raiser_pair = ?, split_json = ?, monthly = ?, client_code = ?,
                 xero_status = 'AUTHORISED'
@@ -919,13 +943,43 @@ def xero_mark_rejected(invoice_id: str, user_id: int, reason: str) -> None:
             """
             UPDATE xero_drafts
             SET hub_status = 'REJECTED', decided_by_user_id = ?, decided_at = ?,
-                reject_reason = ?, xero_status = 'DELETED'
+                reject_reason = ?, xero_status = 'DELETED',
+                external_action_note = NULL
             WHERE invoice_id = ?
             """,
             (user_id, now, reason, invoice_id),
         )
         _write_audit(conn, user_id, None, "xero_reject",
                      f"xero_invoice_id={invoice_id} reason={reason}")
+
+
+def xero_unnotified_approvals_since(since_iso: str, with_pdf: bool = True):
+    """Approved fee notes decided on or after `since_iso` whose raisers were
+    NOT emailed: the latest notify event for the invoice (approve or resend)
+    says notified=none, or there is no notify event at all. Used to re-send
+    approval emails after an email outage without emailing anyone twice."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT d.invoice_id, d.invoice_number, d.contact_name, d.total,
+                   d.entity, d.raiser_pair, d.decided_at, d.hub_status,
+                   d.branded_pdf_filename,
+                   (d.branded_pdf IS NOT NULL) AS has_pdf
+                   %s
+            FROM xero_drafts d
+            WHERE d.hub_status IN ('APPROVED', 'APPROVED_NO_ATTACHMENT')
+              AND d.decided_at >= ?
+              AND COALESCE((
+                    SELECT a.note FROM audit_log a
+                    WHERE a.action IN ('xero_approve_notify', 'xero_resend_notify')
+                      AND a.note LIKE 'xero_invoice_id=' || d.invoice_id || ' %%'
+                    ORDER BY a.id DESC LIMIT 1
+                  ), 'notified=none') LIKE '%%notified=none'
+            ORDER BY d.decided_at
+            """ % (", d.branded_pdf" if with_pdf else ""),
+            (since_iso,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def xero_recent_actioned(limit: int = 50):
@@ -1211,12 +1265,39 @@ def xero_recent_sync_failures(limit: int = 20):
         return [dict(r) for r in rows]
 
 
+def xero_latest_sync_failure_like(needle: str, tenant_id=None):
+    """Newest failed sync-log row whose message contains `needle` (for
+    'already logged this recently' checks that interleaved failures must
+    not defeat)."""
+    with get_conn() as conn:
+        if tenant_id is None:
+            row = conn.execute(
+                "SELECT * FROM xero_sync_log WHERE ok = 0 AND message LIKE ? "
+                "ORDER BY id DESC LIMIT 1", (f"%{needle}%",)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM xero_sync_log WHERE ok = 0 AND message LIKE ? "
+                "AND tenant_id = ? ORDER BY id DESC LIMIT 1",
+                (f"%{needle}%", tenant_id)).fetchone()
+        return dict(row) if row else None
+
+
 def xero_last_sync_time():
     with get_conn() as conn:
         row = conn.execute(
             "SELECT MAX(created_at) AS t FROM xero_sync_log WHERE ok = 1"
         ).fetchone()
         return row["t"] if row else None
+
+
+def xero_last_sync_info():
+    """(created_at, message) of the latest successful sync, or (None, None)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT created_at, message FROM xero_sync_log WHERE ok = 1 "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return (row["created_at"], row["message"]) if row else (None, None)
 
 
 # === AUDIT ===
